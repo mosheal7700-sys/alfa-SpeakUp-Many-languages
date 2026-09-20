@@ -182,6 +182,29 @@ function shuffle(arr) {
   return a;
 }
 
+let cachedVoices = [];
+function refreshVoiceCache() {
+  if (typeof window === "undefined" || !window.speechSynthesis) return;
+  const list = window.speechSynthesis.getVoices();
+  if (list && list.length) cachedVoices = list;
+}
+if (typeof window !== "undefined" && window.speechSynthesis) {
+  refreshVoiceCache();
+  window.speechSynthesis.onvoiceschanged = refreshVoiceCache;
+}
+
+function pickVoice(lang) {
+  const norm = (s) => (s || "").toLowerCase().replace("_", "-");
+  const target = norm(lang);
+  const base = target.split("-")[0];
+  const voices = cachedVoices.length ? cachedVoices : (window.speechSynthesis ? window.speechSynthesis.getVoices() : []);
+  return (
+    voices.find((v) => norm(v.lang) === target) ||
+    voices.find((v) => norm(v.lang).split("-")[0] === base) ||
+    null
+  );
+}
+
 function speak(text, lang = "en-US") {
   try {
     if (!window.speechSynthesis) return;
@@ -189,6 +212,8 @@ function speak(text, lang = "en-US") {
     const u = new SpeechSynthesisUtterance(text);
     u.lang = lang;
     u.rate = 0.92;
+    const voice = pickVoice(lang);
+    if (voice) u.voice = voice;
     window.speechSynthesis.speak(u);
   } catch (e) {
     /* speech synthesis unavailable */
