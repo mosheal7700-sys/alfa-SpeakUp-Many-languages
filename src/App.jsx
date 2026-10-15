@@ -21,6 +21,9 @@ import {
   Mic,
   RotateCcw,
   Lightbulb,
+  Layers,
+  Check,
+  X as XIcon,
 } from "lucide-react";
 
 /* ============================== DATA ============================== */
@@ -152,17 +155,199 @@ const TOPICS = [
   "בבית מלון", "תחביבים", "מזג אוויר", "טכנולוגיה", "תכנון חופשה",
 ];
 
-const BOX_INTERVALS = [0, 1, 3, 7, 14, 30]; // days, index = box
 const GEMINI_MODEL = "gemini-flash-lite-latest";
+
+/* ============================== CHUNK HELPERS (pure logic) ============================== */
+
+// Pure helpers for the "chunks" feature (phrases learned as whole units).
+// Deliberately free of React / DOM code so they can be tested directly in Node.
+
+const BOX_INTERVALS = [0, 1, 3, 7, 14, 30]; // days, index = box
+const MAX_BOX = BOX_INTERVALS.length - 1;
+const BANK_LIMIT = 400;
+
+/* ---------- dates (always LOCAL calendar days) ---------- */
+
+const pad2 = (n) => String(n).padStart(2, "0");
+
+function dateKey(d) {
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+const todayStr = () => dateKey(new Date());
+
+// Built from local y/m/d parts on purpose. Going through toISOString() shifts the
+// result by a day for anyone east of UTC (e.g. Israel), which breaks streaks and due dates.
+function addDays(dateStr, days) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return dateKey(new Date(y, m - 1, d + days));
+}
+
+/* ---------- text matching ---------- */
+
+function levenshtein(a, b) {
+  if (a === b) return 0;
+  const m = a.length;
+  const n = b.length;
+  if (!m) return n;
+  if (!n) return m;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+    }
+    prev = cur;
+  }
+  return prev[n];
+}
+
+// Lowercase, drop diacritics and punctuation, split into words.
+// Dropping diacritics keeps matching forgiving for learners (e.g. Czech, French, Spanish).
+function normTokens(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[\u2018\u2019`\u00b4]/g, "'")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\p{L}\p{N}\s']/gu, " ")
+    .split(/\s+/)
+    .map((t) => t.replace(/^'+|'+$/g, ""))
+    .filter(Boolean);
+}
+
+function tokenEq(x, y) {
+  return x === y || (x.length >= 5 && y.length >= 5 && levenshtein(x, y) <= 1);
+}
+
+function lcsLen(a, b) {
+  let prev = new Array(b.length + 1).fill(0);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = new Array(b.length + 1).fill(0);
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = tokenEq(a[i - 1], b[j - 1]) ? prev[j - 1] + 1 : Math.max(prev[j], cur[j - 1]);
+    }
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+// 0..1 - how much of the chunk appears, in order and nearly contiguous, inside what was said.
+function chunkMatch(chunkText, spokenText) {
+  const a = normTokens(chunkText);
+  const b = normTokens(spokenText);
+  if (!a.length || !b.length) return 0;
+  let best = 0;
+  const maxLen = Math.min(b.length, a.length + 2);
+  for (let len = Math.min(a.length, b.length); len <= maxLen; len++) {
+    for (let i = 0; i + len <= b.length; i++) {
+      const r = lcsLen(a, b.slice(i, i + len)) / a.length;
+      if (r > best) best = r;
+      if (best >= 1) return 1;
+    }
+  }
+  return best;
+}
+
+/* ---------- spaced repetition ---------- */
+
+function retrievalUpdate(chunk, known, today) {
+  const box = known ? Math.min((chunk.box || 0) + 1, MAX_BOX) : 1;
+  return {
+    ...chunk,
+    box,
+    due: known ? addDays(today, BOX_INTERVALS[box]) : today,
+    stage: Math.max(chunk.stage || 0, known ? 2 : 1),
+    reviews: (chunk.reviews || 0) + 1,
+    lapses: (chunk.lapses || 0) + (known ? 0 : 1),
+    lastReviewed: today,
+  };
+}
+
+function usageUpdate(chunk, score, today) {
+  if (score == null) return chunk;
+  const next = { ...chunk, usage: score };
+  if (score >= 1) next.stage = Math.max(chunk.stage || 0, 3);
+  if (score === 0) {
+    const tomorrow = addDays(today, 1);
+    if (!next.due || next.due > tomorrow) next.due = tomorrow;
+  }
+  return next;
+}
+
+// Using a learned chunk naturally in a free conversation counts as a successful recall,
+// but only moves the schedule when the chunk was actually due (no inflating by repetition).
+function naturalUseUpdate(chunk, today) {
+  const next = { ...chunk, usedInSpeech: (chunk.usedInSpeech || 0) + 1 };
+  if (!chunk.due || chunk.due <= today) {
+    const box = Math.min((chunk.box || 0) + 1, MAX_BOX);
+    next.box = box;
+    next.due = addDays(today, BOX_INTERVALS[box]);
+  }
+  return next;
+}
+
+/* ---------- the chunk bank ---------- */
+
+function pruneBank(bank, limit = BANK_LIMIT) {
+  const ids = Object.keys(bank);
+  if (ids.length <= limit) return bank;
+  const ordered = ids
+    .map((id) => bank[id])
+    .sort((a, b) => (b.box || 0) - (a.box || 0) || String(a.added || "").localeCompare(String(b.added || "")));
+  const drop = new Set(ordered.slice(0, ids.length - limit).map((c) => c.id));
+  const out = {};
+  ids.forEach((id) => {
+    if (!drop.has(id)) out[id] = bank[id];
+  });
+  return out;
+}
+
+function dueChunks(bank, today) {
+  return Object.values(bank || {})
+    .filter((c) => (c.stage || 0) >= 1 && (c.due || today) <= today)
+    .sort((a, b) => String(a.due).localeCompare(String(b.due)) || (a.box || 0) - (b.box || 0));
+}
+
+function chunkStatus(c) {
+  if ((c.stage || 0) < 2) return { key: "new", label: "חדש" };
+  if ((c.box || 0) >= 4) return { key: "mastered", label: "שולט" };
+  return { key: "learning", label: "בלמידה" };
+}
+
+function shuffled(arr) {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+// A few chunks the speaking partner should try to invite: due ones first, then the weakest.
+function pickChunkHints(bank, today, count = 5) {
+  const pool = Object.values(bank || {})
+    .filter((c) => (c.stage || 0) >= 2)
+    .sort((a, b) => String(a.due || today).localeCompare(String(b.due || today)) || (a.box || 0) - (b.box || 0))
+    .slice(0, count * 2);
+  return shuffled(pool).slice(0, count);
+}
+
+// Which learned chunks appear, in full, in something the learner just said.
+function detectUsedChunks(bank, text) {
+  if (normTokens(text).length < 2) return [];
+  return Object.values(bank || {}).filter(
+    (c) => (c.stage || 0) >= 2 && normTokens(c.text).length >= 2 && chunkMatch(c.text, text) >= 1
+  );
+}
+
+function sanitizeChunkText(s) {
+  return String(s || "").replace(/\.{2,}|…/g, " ").replace(/\s+/g, " ").trim();
+}
 
 /* ============================== HELPERS ============================== */
 
-const todayStr = () => new Date().toISOString().slice(0, 10);
-const addDays = (dateStr, days) => {
-  const d = new Date(dateStr + "T00:00:00");
-  d.setDate(d.getDate() + days);
-  return d.toISOString().slice(0, 10);
-};
 const isDue = (dueStr) => dueStr <= todayStr();
 
 function greeting() {
@@ -232,6 +417,7 @@ function defaultLangData() {
     convosDone: {}, // id -> true
     aiSeenWords: [], // words already generated by AI for this language, to avoid repeats
     speakingMemory: { mistakeTags: [] }, // rolling log of recurring grammar/word-choice issue tags
+    chunks: {}, // id -> { id, text, he, ex, exHe, slot, topic, box, due, stage, ... } (phrases learned as whole units)
   };
 }
 
@@ -253,7 +439,12 @@ function migrateState(parsed) {
       ...parsed,
       settings: { ...defaultState().settings, ...parsed.settings },
       stats: { ...defaultState().stats, ...parsed.stats },
-      langData: { en: defaultLangData(), ...parsed.langData },
+      langData: Object.fromEntries(
+        Object.entries({ en: defaultLangData(), ...parsed.langData }).map(([k, v]) => [
+          k,
+          { ...defaultLangData(), ...(v || {}) },
+        ])
+      ),
     };
   }
   // old single-language (English-only) shape - migrate it into langData.en so existing progress isn't lost
@@ -409,7 +600,55 @@ async function generateAIDialogue(apiKey, lang, level, topic) {
   };
 }
 
-async function generateSpeakingTurn(apiKey, lang, level, topic, history, recentFocus) {
+async function generateAIChunks(apiKey, lang, level, topic, excludeTexts) {
+  const langInfo = languageInfo(lang);
+  const prompt = `אתה עוזר ליצירת תוכן לימודי לאפליקציית לימוד שפות לדוברי עברית. שפת היעד היא ${langInfo.label} (${langInfo.nativeName}).
+המטרה: ללמד "צ'אנקים" - צירופי מילים קבועים ושימושיים שדוברים אמיתיים אומרים כיחידה אחת, כדי שהלומד ישלוף אותם בשטף בשיחה (למשל "I'd like to ...", "How long does it take to ...", "I'm thinking about ...").
+צור בדיוק 7 צ'אנקים ב${langInfo.label} ברמת "${levelLabel(level)}", סביב הנושא "${topic}". הצ'אנקים צריכים להיות קשורים זה לזה ולהתאים לשיחה אמיתית בנושא, באורך 2 עד 6 מילים כל אחד, ולא מילים בודדות.
+אל תשתמש בצ'אנקים האלה (כבר נלמדו): ${excludeTexts.length ? excludeTexts.slice(-40).join(" | ") : "אין"}.
+כל איבר במערך הוא אובייקט עם השדות בדיוק האלה: "text" (הצ'אנק ב${langInfo.label}, בלי שלוש נקודות), "he" (תרגום טבעי לעברית), "ex" (משפט דוגמה טבעי ב${langInfo.label} שמשתמש בצ'אנק במלואו כמו שהוא), "exHe" (תרגום המשפט לעברית), "slot" (תיאור קצר בעברית של מה אפשר להחליף בצ'אנק, למשל "אפשר להחליף את הפועל", או מחרוזת ריקה אם אין).
+החזר אך ורק JSON תקין - מערך של 7 אובייקטים - בלי טקסט נוסף.`;
+  const arr = await callGemini(apiKey, prompt);
+  if (!Array.isArray(arr) || arr.length === 0) throw new Error("פורמט תשובה לא תקין");
+  const stamp = Date.now();
+  return arr
+    .filter((c) => c && c.text && c.he)
+    .slice(0, 8)
+    .map((c, i) => ({
+      id: `ch-${stamp}-${i}`,
+      text: sanitizeChunkText(c.text),
+      he: String(c.he),
+      ex: String(c.ex || ""),
+      exHe: String(c.exHe || ""),
+      slot: String(c.slot || ""),
+      topic,
+      level,
+    }))
+    .filter((c) => c.text);
+}
+
+async function evaluateChunkUsage(apiKey, lang, level, chunk, sentence) {
+  const langInfo = languageInfo(lang);
+  const prompt = `אתה מורה סבלני ל${langInfo.label} (${langInfo.nativeName}) ללומד ישראלי ברמת "${levelLabel(level)}".
+התלמיד למד את הצ'אנק: "${chunk.text}" (${chunk.he}) ונתבקש לבנות משפט משלו שמשתמש בו.
+המשפט של התלמיד (ייתכן שהוקלד או תומלל מדיבור, אז התעלם משגיאות איות/פיסוק קלות): "${sentence}"
+החזר אובייקט JSON בפורמט הבא בדיוק:
+{"usedChunk": true אם הצ'אנק מופיע במשפט בצורה סבירה (גם עם שינוי קל בזמן/גוף) אחרת false, "score": 2 אם המשפט נכון וטבעי, 1 אם המסר ברור אך יש טעות או ניסוח לא טבעי, 0 אם הצ'אנק לא נעשה בו שימוש נכון, "correction": "גרסה טבעית ומתוקנת ב${langInfo.label} של המשפט, או null אם אין צורך", "feedbackHe": "משפט אחד קצר, חם ומעודד בעברית עם התיקון או החיזוק", "alt": "משפט דוגמה נוסף ב${langInfo.label} עם אותו צ'אנק, בנושא אחר"}
+החזר אך ורק JSON תקין, בלי טקסט נוסף.`;
+  const obj = await callGemini(apiKey, prompt);
+  if (!obj || typeof obj !== "object") throw new Error("פורמט תשובה לא תקין");
+  let score = Number(obj.score);
+  if (![0, 1, 2].includes(score)) score = obj.usedChunk ? 1 : 0;
+  if (obj.usedChunk === false) score = 0;
+  return {
+    score,
+    correction: obj.correction ? String(obj.correction) : null,
+    feedbackHe: String(obj.feedbackHe || ""),
+    alt: obj.alt ? String(obj.alt) : "",
+  };
+}
+
+async function generateSpeakingTurn(apiKey, lang, level, topic, history, recentFocus, chunkTexts = []) {
   const langInfo = languageInfo(lang);
   const levelHe = levelLabel(level);
   const isOpening = history.length === 0;
@@ -417,19 +656,23 @@ async function generateSpeakingTurn(apiKey, lang, level, topic, history, recentF
   const focusNote = recentFocus
     ? `\nמידע רקע (לשימושך בלבד, אל תזכיר את זה במפורש לתלמיד): לאחרונה התלמיד נטה לטעות בעיקר בתחומים הבאים: ${recentFocus}. אם רלוונטי לשיחה, אפשר לתת לו הזדמנות עדינה לתרגל את זה, אבל בלי להעמיס - ואם הוא כבר לא טועה בזה, אל תחזור על ההערה שוב ושוב.\n`
     : "";
+  const chunkNote = chunkTexts.length
+    ? `\nהתלמיד למד לאחרונה את הצ'אנקים האלה (צירופי מילים): ${chunkTexts.map((t) => `"${t}"`).join(", ")}. נסח את השאלה/התגובה שלך כך שתזמין אותו באופן טבעי להשתמש באחד או שניים מהם בתשובתו (בלי לציין זאת במפורש). אל תכריח - רק אם זה מתאים לשיחה.\n`
+    : "";
+  const hintSpec = `2-3 צ'אנקים שימושיים (צירופי מילים קצרים של 2-5 מילים, לא מילים בודדות) ב${langInfo.label} שהתלמיד יכול להשתמש בהם כדי לענות, ואם אפשר העדף את הצ'אנקים שלמד`;
   const prompt = isOpening
-    ? `אתה שותף שיחה סבלני וממריץ לתרגול ${langInfo.label} (${langInfo.nativeName}) מדוברת, עבור לומד ישראלי ברמת "${levelHe}"${topic ? ` בנושא "${topic}"` : ""}.${focusNote}
+    ? `אתה שותף שיחה סבלני וממריץ לתרגול ${langInfo.label} (${langInfo.nativeName}) מדוברת, עבור לומד ישראלי ברמת "${levelHe}"${topic ? ` בנושא "${topic}"` : ""}.${focusNote}${chunkNote}
 פתח בשאלה קצרה, טבעית וידידותית ב${langInfo.label} שתתחיל שיחה קצרה בנושא הזה.
 החזר אובייקט JSON בפורמט הבא בדיוק (השדה reply חייב להיות ב${langInfo.label}, לא בעברית ולא באנגלית אלא אם שפת היעד היא אנגלית):
-{"reply": "המשפט/שאלה הפותחת שלך ב${langInfo.label}, קצרה וטבעית", "replyHe": "תרגום לעברית של reply", "correction": null, "feedbackHe": null, "mistakeTag": null, "hint": ["2-3 מילים או ביטויים קצרים ב${langInfo.label} שיכולים לעזור לתלמיד לענות"]}
+{"reply": "המשפט/שאלה הפותחת שלך ב${langInfo.label}, קצרה וטבעית", "replyHe": "תרגום לעברית של reply", "correction": null, "feedbackHe": null, "mistakeTag": null, "hint": ["${hintSpec}"]}
 החזר אך ורק JSON תקין, בלי שום טקסט נוסף.`
-    : `אתה שותף שיחה סבלני וממריץ לתרגול ${langInfo.label} (${langInfo.nativeName}) מדוברת, עבור לומד ישראלי ברמת "${levelHe}"${topic ? ` בנושא "${topic}"` : ""}.${focusNote}
+    : `אתה שותף שיחה סבלני וממריץ לתרגול ${langInfo.label} (${langInfo.nativeName}) מדוברת, עבור לומד ישראלי ברמת "${levelHe}"${topic ? ` בנושא "${topic}"` : ""}.${focusNote}${chunkNote}
 זהו המשך שיחה. הנה תמלול השיחה עד כה (תמלול המשפטים של התלמיד נעשה מזיהוי דיבור אוטומטי, ולכן ייתכנו שגיאות תעתיק קלות - התייחס בעיקר לדקדוק, מבנה משפט ובחירת מילים, ולא לשגיאות איות שנובעות מתעתיק):
 ${historyText}
 
 הגב באופן טבעי וקצר להמשך השיחה ב${langInfo.label} (כמו שותף שיחה אמיתי, לא כמורה), ובנוסף תקן בעדינות את המשפט האחרון של התלמיד רק אם יש בו טעות דקדוק או מבנה משמעותית.
 החזר אובייקט JSON בפורמט הבא בדיוק (reply ו-correction חייבים להיות ב${langInfo.label}):
-{"reply": "התגובה או השאלה הבאה שלך ב${langInfo.label}, קצרה וטבעית", "replyHe": "תרגום לעברית של reply", "correction": "גרסה מתוקנת ומשופרת ב${langInfo.label} של משפט התלמיד האחרון - רק אם היו טעויות משמעותיות, אחרת null", "feedbackHe": "משפט עידוד קצר וממוקד בעברית שמסביר בעדינות את התיקון - רק אם יש correction, אחרת null", "mistakeTag": "תיוג קצר מאוד (2-3 מילים בעברית) של סוג הטעות, למשל 'זמן עבר', 'מילות יחס', 'סדר מילים' - רק אם יש correction, אחרת null", "hint": ["2-3 מילים או ביטויים קצרים ב${langInfo.label} שיכולים לעזור לתלמיד לענות לשאלה הבאה"]}
+{"reply": "התגובה או השאלה הבאה שלך ב${langInfo.label}, קצרה וטבעית", "replyHe": "תרגום לעברית של reply", "correction": "גרסה מתוקנת ומשופרת ב${langInfo.label} של משפט התלמיד האחרון - רק אם היו טעויות משמעותיות, אחרת null", "feedbackHe": "משפט עידוד קצר וממוקד בעברית שמסביר בעדינות את התיקון - רק אם יש correction, אחרת null", "mistakeTag": "תיוג קצר מאוד (2-3 מילים בעברית) של סוג הטעות, למשל 'זמן עבר', 'מילות יחס', 'סדר מילים' - רק אם יש correction, אחרת null", "hint": ["${hintSpec}"]}
 היה חם, סבלני ומעודד. התמקד במסירת המסר ולא בשלמות לשונית - אם התלמיד הצליח להעביר את הכוונה בבירור, ציין זאת בחיוב גם אם המשפט לא מושלם לחלוטין.
 החזר אך ורק JSON תקין, בלי שום טקסט נוסף.`;
   const obj = await callGemini(apiKey, prompt);
@@ -714,7 +957,7 @@ function GlobalStyle() {
 
 /* ============================== HOME VIEW ============================== */
 
-function Home({ state, langData, currentLang, setLevel, setLanguage, dueCount, newCount, onGo }) {
+function Home({ state, langData, currentLang, setLevel, setLanguage, dueCount, newCount, chunkDue, chunkTotal, onGo }) {
   const doneToday = state.stats.lastActiveDate === todayStr();
   const aiOn = !!state.settings.apiKey;
   const langInfo = languageInfo(currentLang);
@@ -789,6 +1032,19 @@ function Home({ state, langData, currentLang, setLevel, setLanguage, dueCount, n
               : "תרגלו דיאלוגים אמיתיים עם הגייה מוקראת, לפי מצבים יומיומיים."}
           </p>
         </div>
+        {aiOn && (
+          <div className="ela-bigcard" onClick={() => onGo("chunks")}>
+            <div className="icon-wrap" style={{ background: "var(--sage-light)", color: "var(--sage)" }}><Layers size={22} /></div>
+            <h3>צ'אנקים</h3>
+            <p>
+              {chunkDue > 0
+                ? `${chunkDue} צירופי מילים מחכים לשליפה בדיבור`
+                : chunkTotal > 0
+                ? "ללמוד עוד צירופים שימושיים ולשלוף אותם בשטף"
+                : "לומדים צירופי מילים שלמים ושולפים אותם בקול - הדרך לשטף בשיחה."}
+            </p>
+          </div>
+        )}
         {aiOn && (
           <div className="ela-bigcard" onClick={() => onGo("speaking")}>
             <div className="icon-wrap" style={{ background: "var(--rose-light)", color: "var(--rose)" }}><Mic size={22} /></div>
@@ -1170,7 +1426,7 @@ function Settings({ state, onSave }) {
 
 /* ============================== SPEAKING PRACTICE VIEW ============================== */
 
-function SpeakingPractice({ level, lang, apiKey, recentFocus, onMistakeTag, onBack, onSessionEnd }) {
+function SpeakingPractice({ level, lang, apiKey, recentFocus, chunks, onChunksUsed, onMistakeTag, onBack, onSessionEnd }) {
   const [topic, setTopic] = useState(null);
   const [customTopic, setCustomTopic] = useState("");
   const [history, setHistory] = useState([]); // { role: 'ai'|'user', text, textHe?, correction?, feedbackHe?, mistakeTag?, hint? }
@@ -1193,13 +1449,18 @@ function SpeakingPractice({ level, lang, apiKey, recentFocus, onMistakeTag, onBa
   }, []);
 
   const effectiveLevel = level === "all" ? "intermediate" : level;
+  // a few already-learned chunks the partner should try to invite into the conversation
+  const chunkHintsRef = useRef(null);
+  if (chunkHintsRef.current === null) {
+    chunkHintsRef.current = pickChunkHints(chunks || {}, todayStr(), 5).map((c) => c.text);
+  }
 
   async function startTopic(t) {
     setTopic(t);
     setPhase("loading");
     setError(null);
     try {
-      const turn = await generateSpeakingTurn(apiKey, lang, effectiveLevel, t, [], recentFocus);
+      const turn = await generateSpeakingTurn(apiKey, lang, effectiveLevel, t, [], recentFocus, chunkHintsRef.current);
       setHistory([{ role: "ai", text: turn.reply, textHe: turn.replyHe, hint: turn.hint }]);
       setPhase("ready");
     } catch (e) {
@@ -1306,13 +1567,17 @@ function SpeakingPractice({ level, lang, apiKey, recentFocus, onMistakeTag, onBa
   async function sendAnswer(text) {
     if (!text || !text.trim()) return;
     const userTurn = { role: "user", text: text.trim() };
+    if (onChunksUsed) {
+      const used = detectUsedChunks(chunks || {}, userTurn.text);
+      if (used.length) onChunksUsed(used.map((c) => c.id));
+    }
     const nextHistory = [...history, userTurn];
     setHistory(nextHistory);
     setPhase("sending");
     setShowHint(false);
     setTranscript("");
     try {
-      const turn = await generateSpeakingTurn(apiKey, lang, effectiveLevel, topic, nextHistory, recentFocus);
+      const turn = await generateSpeakingTurn(apiKey, lang, effectiveLevel, topic, nextHistory, recentFocus, chunkHintsRef.current);
       const withFeedback = nextHistory.map((h, i) =>
         i === nextHistory.length - 1 ? { ...h, correction: turn.correction, feedbackHe: turn.feedbackHe, mistakeTag: turn.mistakeTag } : h
       );
@@ -1492,6 +1757,452 @@ function SpeakingPractice({ level, lang, apiKey, recentFocus, onMistakeTag, onBa
   );
 }
 
+/* ============================== CHUNKS ============================== */
+
+// Hold-to-talk speech capture (same behaviour as the speaking practice, packaged for reuse).
+function useHoldToTalk(speechLang, onFinish) {
+  const [phase, setPhase] = useState("idle"); // idle | starting | listening
+  const [error, setError] = useState(null);
+  const recRef = useRef(null);
+  const heldRef = useRef(false);
+  const committedRef = useRef("");
+  const stopScheduledRef = useRef(false);
+  const finishRef = useRef(onFinish);
+  finishRef.current = onFinish;
+  const supported = !!getSpeechRecognition();
+
+  useEffect(() => {
+    return () => {
+      heldRef.current = false;
+      try { recRef.current && recRef.current.abort(); } catch (e) { /* noop */ }
+    };
+  }, []);
+
+  function finish() {
+    setPhase("idle");
+    const text = committedRef.current.trim();
+    if (text && finishRef.current) finishRef.current(text);
+  }
+
+  function launch() {
+    try { recRef.current && recRef.current.abort(); } catch (e) { /* noop */ }
+    const rec = getSpeechRecognition();
+    if (!rec) return;
+    recRef.current = rec;
+    rec.lang = speechLang;
+    rec.continuous = true;
+    rec.interimResults = false;
+    rec.maxAlternatives = 1;
+    let sessionFinal = "";
+    rec.onaudiostart = () => setPhase((p) => (p === "starting" ? "listening" : p));
+    rec.onresult = (event) => {
+      let parts = [];
+      for (let i = 0; i < event.results.length; i++) {
+        const t = (event.results[i][0].transcript || "").trim();
+        if (!t) continue;
+        const joined = parts.join(" ");
+        if (joined && t.toLowerCase().startsWith(joined.toLowerCase())) parts = [t];
+        else if (!joined.toLowerCase().includes(t.toLowerCase())) parts.push(t);
+      }
+      sessionFinal = parts.join(" ");
+    };
+    rec.onerror = (event) => {
+      if (event.error === "not-allowed") {
+        heldRef.current = false;
+        setError("הגישה למיקרופון נחסמה. אשרו הרשאת מיקרופון בדפדפן ונסו שוב.");
+        setPhase("idle");
+      }
+    };
+    rec.onend = () => {
+      if (sessionFinal) committedRef.current = (committedRef.current + " " + sessionFinal).trim();
+      if (heldRef.current) launch();
+      else finish();
+    };
+    try { rec.start(); } catch (e) { /* start() can throw if called too quickly */ }
+  }
+
+  function startHold() {
+    if (heldRef.current) return;
+    stopScheduledRef.current = false;
+    heldRef.current = true;
+    committedRef.current = "";
+    setError(null);
+    setPhase("starting");
+    launch();
+  }
+
+  function stopHold() {
+    if (!heldRef.current || stopScheduledRef.current) return;
+    stopScheduledRef.current = true;
+    setTimeout(() => {
+      stopScheduledRef.current = false;
+      heldRef.current = false;
+      try { recRef.current && recRef.current.stop(); } catch (e) { finish(); }
+    }, 400); // grace period so the last word isn't clipped
+  }
+
+  return { phase, error, supported, startHold, stopHold };
+}
+
+function HoldMic({ mic, label }) {
+  const active = mic.phase === "listening" || mic.phase === "starting";
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
+      <button
+        className={"ela-micbtn" + (active ? " listening" : "")}
+        onPointerDown={(e) => { e.preventDefault(); mic.startHold(); }}
+        onPointerUp={mic.stopHold}
+        onPointerLeave={mic.stopHold}
+        onPointerCancel={mic.stopHold}
+        onContextMenu={(e) => e.preventDefault()}
+        aria-label="החזיקו כדי לדבר"
+      >
+        <Mic size={26} />
+      </button>
+      <span style={{ fontSize: 12.5, color: "var(--muted)" }}>
+        {mic.phase === "starting" ? "מתחברים למיקרופון..." : mic.phase === "listening" ? "מקליט... שחררו כשסיימתם" : label}
+      </span>
+      {mic.error && <div className="ela-errbox">{mic.error}</div>}
+    </div>
+  );
+}
+
+function ChunkStep({ step, chunk, lang, level, apiKey, langInfo, onResult }) {
+  // step.type: recognize | retrieve | use
+  const [revealed, setRevealed] = useState(false);
+  const [heard, setHeard] = useState("");
+  const [typing, setTyping] = useState(false);
+  const [typed, setTyped] = useState("");
+  const [gaveUp, setGaveUp] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [fb, setFb] = useState(null);
+  const [err, setErr] = useState(null);
+
+  const mic = useHoldToTalk(langInfo.speechLang, (t) => {
+    setHeard(t);
+    if (step.type === "retrieve") setRevealed(true);
+    if (step.type === "use") setTyped(t);
+  });
+
+  useEffect(() => {
+    if (step.type === "recognize") speak(chunk.text, langInfo.speechLang);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  if (step.type === "recognize") {
+    return (
+      <div>
+        <div className="ela-flashcard" style={{ cursor: "default" }}>
+          <div className="hint">שלב 1 · הכירו את הצ'אנק</div>
+          <div className="word" style={{ fontSize: 32 }}>{chunk.text}</div>
+          <button className="ela-iconbtn" onClick={() => speak(chunk.text, langInfo.speechLang)} aria-label="השמעה"><Volume2 size={18} /></button>
+          <div className="translation">{chunk.he}</div>
+          {chunk.ex && <div className="example">{chunk.ex}</div>}
+          {chunk.exHe && <div className="exampleHe">{chunk.exHe}</div>}
+          {chunk.slot && <div className="hint">💡 {chunk.slot}</div>}
+        </div>
+        <div style={{ textAlign: "center", marginTop: 16 }}>
+          <button className="ela-btn" onClick={() => onResult({ ok: true })}>הבנתי, הבא</button>
+        </div>
+      </div>
+    );
+  }
+
+  if (step.type === "retrieve") {
+    const match = heard ? chunkMatch(chunk.text, heard) : 0;
+    const good = match >= 0.8;
+    const submitTyped = () => {
+      if (!typed.trim()) return;
+      setHeard(typed.trim());
+      setRevealed(true);
+    };
+    return (
+      <div>
+        <div className="ela-flashcard" style={{ cursor: "default" }}>
+          <div className="hint">שלב 2 · אמרו בקול את הצ'אנק</div>
+          <div className="translation" style={{ fontSize: 26 }}>{chunk.he}</div>
+          {chunk.slot && !revealed && <div className="hint">{chunk.slot}</div>}
+          {revealed && (
+            <>
+              <div className="word" style={{ fontSize: 30 }}>{chunk.text}</div>
+              <button className="ela-iconbtn" onClick={() => speak(chunk.text, langInfo.speechLang)} aria-label="השמעה"><Volume2 size={18} /></button>
+              {heard && (
+                <div className="example" style={{ color: good ? "var(--sage)" : "var(--rose)" }}>
+                  {good ? "✓ נשמע שאמרתם: " : "שמענו: "}“{heard}”
+                </div>
+              )}
+              {chunk.ex && <div className="example">{chunk.ex}</div>}
+            </>
+          )}
+        </div>
+        <div style={{ marginTop: 18, display: "flex", flexDirection: "column", alignItems: "center", gap: 12 }}>
+          {!revealed ? (
+            <>
+              {mic.supported && !typing && <HoldMic mic={mic} label="החזיקו ואמרו את הצ'אנק" />}
+              {(!mic.supported || typing) && (
+                <div style={{ display: "flex", gap: 8, width: "100%" }}>
+                  <input
+                    className="ela-field" dir="ltr" autoFocus value={typed}
+                    placeholder={`הקלידו את הצ'אנק ב${langInfo.label}...`}
+                    onChange={(e) => setTyped(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") submitTyped(); }}
+                  />
+                  <button className="ela-btn" disabled={!typed.trim()} onClick={submitTyped}>בדיקה</button>
+                </div>
+              )}
+              <div style={{ display: "flex", gap: 14, flexWrap: "wrap", justifyContent: "center" }}>
+                {mic.supported && (
+                  <button className="ela-chip" onClick={() => setTyping((v) => !v)}>{typing ? "חזרה להקלטה" : "להקליד במקום"}</button>
+                )}
+                <button className="ela-chip" onClick={() => { setGaveUp(true); setRevealed(true); }}>הצג תשובה</button>
+              </div>
+            </>
+          ) : gaveUp && !heard ? (
+            <button className="ela-btn" onClick={() => onResult({ known: false })}>נחזור על זה בקרוב</button>
+          ) : (
+            <div style={{ display: "flex", gap: 10 }}>
+              <button className="ela-btn secondary" onClick={() => onResult({ known: false })}><XIcon size={16} />עוד לא</button>
+              <button className="ela-btn" style={good ? undefined : { background: "var(--sage)" }} onClick={() => onResult({ known: true })}><Check size={16} />ידעתי</button>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // step.type === "use": build your own sentence with the chunk
+  async function submit() {
+    const sentence = typed.trim();
+    if (!sentence) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      setFb(await evaluateChunkUsage(apiKey, lang, level, chunk, sentence));
+    } catch (e) {
+      setErr(e.message || "שגיאה בבדיקת המשפט");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div>
+      <div className="ela-flashcard" style={{ cursor: "default", minHeight: 150 }}>
+        <div className="hint">שלב 3 · בנו משפט משלכם</div>
+        <div className="word" style={{ fontSize: 28 }}>{chunk.text}</div>
+        <div className="translation" style={{ fontSize: 18 }}>{chunk.he}</div>
+        {chunk.slot && <div className="hint">💡 {chunk.slot}</div>}
+      </div>
+      <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 12, alignItems: "center" }}>
+        {!fb ? (
+          <>
+            {mic.supported && <HoldMic mic={mic} label="החזיקו ואמרו משפט עם הצ'אנק" />}
+            <textarea
+              className="ela-transcriptbox" dir="ltr" rows={2} value={typed}
+              placeholder={`משפט ב${langInfo.label} עם "${chunk.text}"`}
+              onChange={(e) => setTyped(e.target.value)}
+            />
+            {err && <div className="ela-errbox">{err}</div>}
+            <div style={{ display: "flex", gap: 10 }}>
+              <button className="ela-btn secondary" onClick={() => onResult({ skip: true })}>דלגו</button>
+              <button className="ela-btn" disabled={!typed.trim() || busy} onClick={submit}>
+                {busy ? <Loader2 size={16} className="ela-spin" /> : null}בדיקה
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="ela-correction" style={{ width: "100%" }}>
+              <div className="label">{fb.score === 2 ? "מצוין!" : fb.score === 1 ? "כמעט שם" : "ננסה שוב בהמשך"}</div>
+              {fb.correction && <div className="fixed">{fb.correction}</div>}
+              {fb.feedbackHe && <div className="fb">{fb.feedbackHe}</div>}
+              {fb.alt && <div className="fb" dir="ltr" style={{ marginTop: 6 }}>{fb.alt}</div>}
+            </div>
+            <button className="ela-btn" onClick={() => onResult({ score: fb.score })}>המשך</button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ChunkPractice({ lang, level, apiKey, chunks, onSave, onFinish, onBack }) {
+  const langInfo = languageInfo(lang);
+  const effectiveLevel = level === "all" ? "intermediate" : level;
+  const bankRef = useRef(chunks || {});
+  const [view, setView] = useState("menu"); // menu | loading | session | summary
+  const [steps, setSteps] = useState([]);
+  const [idx, setIdx] = useState(0);
+  const [results, setResults] = useState({ known: 0, missed: 0, used: 0 });
+  const [customTopic, setCustomTopic] = useState("");
+  const [error, setError] = useState(null);
+  const [showList, setShowList] = useState(false);
+  const [, force] = useState(0);
+  const today = todayStr();
+
+  const bank = bankRef.current;
+  const all = Object.values(bank);
+  const due = dueChunks(bank, today);
+  const counts = { new: 0, learning: 0, mastered: 0 };
+  all.forEach((c) => { counts[chunkStatus(c).key]++; });
+
+  function commit(next, xp = 0) {
+    bankRef.current = next;
+    onSave(next, xp);
+    force((n) => n + 1);
+  }
+
+  function beginSession(list, includeUse) {
+    const ids = list.map((c) => c.id);
+    const s = [];
+    if (list.some((c) => (c.stage || 0) < 1)) ids.forEach((id) => s.push({ type: "recognize", id }));
+    ids.forEach((id) => s.push({ type: "retrieve", id }));
+    if (includeUse) {
+      list.filter((c) => (c.stage || 0) < 3).slice(0, 3).forEach((c) => s.push({ type: "use", id: c.id }));
+    }
+    setSteps(s);
+    setIdx(0);
+    setResults({ known: 0, missed: 0, used: 0 });
+    setView("session");
+  }
+
+  async function startNew(topic) {
+    setError(null);
+    setView("loading");
+    try {
+      const exclude = Object.values(bankRef.current).map((c) => c.text);
+      const fresh = await generateAIChunks(apiKey, lang, effectiveLevel, topic, exclude);
+      if (!fresh.length) throw new Error("לא נוצרו צ'אנקים, נסו שוב.");
+      const next = { ...bankRef.current };
+      fresh.forEach((c) => { next[c.id] = { ...c, box: 0, due: todayStr(), stage: 0, added: todayStr(), reviews: 0, lapses: 0 }; });
+      commit(pruneBank(next));
+      beginSession(fresh.map((c) => bankRef.current[c.id]).filter(Boolean), true);
+    } catch (e) {
+      setError(e.message || "שגיאה ביצירת צ'אנקים");
+      setView("menu");
+    }
+  }
+
+  function startReview() {
+    beginSession(dueChunks(bankRef.current, todayStr()).slice(0, 10), true);
+  }
+
+  function handleResult(r) {
+    const step = steps[idx];
+    const cur = bankRef.current[step.id];
+    if (cur) {
+      const t = todayStr();
+      if (step.type === "recognize") {
+        commit({ ...bankRef.current, [cur.id]: { ...cur, stage: Math.max(cur.stage || 0, 1) } });
+      } else if (step.type === "retrieve") {
+        commit({ ...bankRef.current, [cur.id]: retrievalUpdate(cur, !!r.known, t) }, r.known ? 10 : 2);
+        setResults((x) => ({ ...x, known: x.known + (r.known ? 1 : 0), missed: x.missed + (r.known ? 0 : 1) }));
+      } else if (step.type === "use" && !r.skip) {
+        commit({ ...bankRef.current, [cur.id]: usageUpdate(cur, r.score, t) }, r.score === 2 ? 15 : 8);
+        setResults((x) => ({ ...x, used: x.used + 1 }));
+      }
+    }
+    if (idx + 1 >= steps.length) setView("summary");
+    else setIdx(idx + 1);
+  }
+
+  if (view === "loading") {
+    return (
+      <div>
+        <BackRow onBack={onBack} />
+        <div className="ela-loadingbox"><Loader2 size={30} className="ela-spin" /><p>ה-AI מכין צ'אנקים חדשים...</p></div>
+      </div>
+    );
+  }
+
+  if (view === "session") {
+    const step = steps[idx];
+    const chunk = bankRef.current[step.id];
+    return (
+      <div>
+        <BackRow onBack={() => setView("menu")} label="סיום מוקדם" />
+        <div className="ela-progressbar"><div style={{ width: `${(idx / steps.length) * 100}%` }} /></div>
+        <ChunkStep key={idx} step={step} chunk={chunk} lang={lang} level={effectiveLevel} apiKey={apiKey} langInfo={langInfo} onResult={handleResult} />
+      </div>
+    );
+  }
+
+  if (view === "summary") {
+    return (
+      <div style={{ textAlign: "center", paddingTop: 20 }}>
+        <Sparkles size={30} color="var(--gold)" />
+        <h1 className="ela-h1" style={{ marginTop: 12 }}>סיימתם!</h1>
+        <p className="ela-sub">
+          שלפתם נכון {results.known} צ'אנקים{results.missed ? `, ${results.missed} יחזרו אליכם בקרוב` : ""}
+          {results.used ? `, ובניתם ${results.used} משפטים משלכם` : ""}.
+        </p>
+        <p className="ela-sub" style={{ marginTop: -8 }}>בתרגול הדיבור ה-AI ינסה להזמין אתכם להשתמש בצ'אנקים שלמדתם.</p>
+        <div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 16 }}>
+          <button className="ela-btn secondary" onClick={() => setView("menu")}>עוד צ'אנקים</button>
+          <button className="ela-btn" onClick={() => onFinish()}>לדף הבית</button>
+        </div>
+      </div>
+    );
+  }
+
+  const topicBtn = (t) => (
+    <button key={t} className="ela-chip" onClick={() => startNew(t)}>{t}</button>
+  );
+  return (
+    <div>
+      <BackRow onBack={onBack} />
+      <h1 className="ela-h1">צ'אנקים</h1>
+      <p className="ela-sub">
+        לומדים צירופי מילים שלמים ב{langInfo.label} ושולפים אותם בשטף - במקום מילים בודדות. זיהוי, שליפה בדיבור, ובניית משפט משלכם.
+      </p>
+      {error && <div className="ela-errbox">{error}</div>}
+
+      {all.length > 0 && (
+        <div style={{ display: "flex", gap: 18, color: "var(--muted)", fontSize: 13.5, marginBottom: 14, flexWrap: "wrap" }}>
+          <span><b style={{ color: "var(--ink)" }}>{all.length}</b> צ'אנקים</span>
+          <span><b style={{ color: "var(--ink)" }}>{counts.learning + counts.new}</b> בלמידה</span>
+          <span><b style={{ color: "var(--sage)" }}>{counts.mastered}</b> שולטים</span>
+        </div>
+      )}
+
+      {due.length > 0 && (
+        <div className="ela-bigcard" style={{ marginBottom: 16 }} onClick={startReview}>
+          <div className="icon-wrap" style={{ background: "var(--rose-light)", color: "var(--rose)" }}><Layers size={22} /></div>
+          <h3>חזרה על צ'אנקים</h3>
+          <p>{due.length} צ'אנקים מחכים לשליפה. זה בדיוק התרגול שמחזק את השטף.</p>
+        </div>
+      )}
+
+      <p className="ela-sub" style={{ marginBottom: 10, fontWeight: 600 }}>צ'אנקים חדשים - בחרו נושא או כתבו משלכם:</p>
+      <div className="ela-fieldrow" style={{ marginBottom: 14 }}>
+        <input
+          className="ela-field" placeholder="למשל: שיחת חולין עם עמית לעבודה" value={customTopic}
+          onChange={(e) => setCustomTopic(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter" && customTopic.trim()) startNew(customTopic.trim()); }}
+        />
+        <button className="ela-btn" disabled={!customTopic.trim()} onClick={() => startNew(customTopic.trim())}>התחילו</button>
+      </div>
+      <div className="ela-chiprow">{TOPICS.map(topicBtn)}</div>
+
+      {all.length > 0 && (
+        <div style={{ marginTop: 22 }}>
+          <button className="ela-chip" onClick={() => setShowList((v) => !v)}>{showList ? "הסתר את הצ'אנקים שלי" : "הצ'אנקים שלי"}</button>
+          {showList && (
+            <div style={{ marginTop: 10 }}>
+              {[...all].reverse().slice(0, 60).map((c) => (
+                <div key={c.id} className="ela-optbtn" style={{ cursor: "default", display: "flex", justifyContent: "space-between", gap: 8 }}>
+                  <span dir="ltr" style={{ textAlign: "left" }}>{c.text}</span>
+                  <span style={{ fontWeight: 500, color: "var(--muted)", fontSize: 13 }}>{c.he} · {chunkStatus(c).label}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ============================== ONBOARDING ============================== */
 
 function Onboarding({ onFinish }) {
@@ -1638,6 +2349,30 @@ export default function App() {
     updateLangData({ speakingMemory: { ...langData.speakingMemory, mistakeTags } });
   }
 
+  function saveChunks(chunks, xp = 0) {
+    const stats = xp ? { ...state.stats, xp: state.stats.xp + xp } : state.stats;
+    persist({ ...state, stats, langData: { ...state.langData, [currentLang]: { ...langData, chunks } } });
+  }
+
+  function finishChunkSession() {
+    persist({
+      ...state,
+      stats: touchStreak({ ...state.stats, sessionsCompleted: state.stats.sessionsCompleted + 1 }),
+    });
+    goTab("home");
+  }
+
+  // learned chunks used naturally in a speaking conversation count as a successful recall
+  function markChunksUsed(ids) {
+    const t = todayStr();
+    const chunks = { ...(langData.chunks || {}) };
+    let changed = false;
+    ids.forEach((id) => {
+      if (chunks[id]) { chunks[id] = naturalUseUpdate(chunks[id], t); changed = true; }
+    });
+    if (changed) saveChunks(chunks, 5 * ids.length);
+  }
+
   const recentFocus = summarizeFocusAreas(langData.speakingMemory?.mistakeTags || []);
 
   async function openAIConvo(topic) {
@@ -1666,6 +2401,7 @@ export default function App() {
     { id: "home", label: "בית", Icon: HomeIcon },
     { id: "vocab", label: "מילים", Icon: BookOpen },
     { id: "convo", label: "שיחה", Icon: MessageCircle },
+    ...(state.settings.apiKey ? [{ id: "chunks", label: "צ'אנקים", Icon: Layers }] : []),
     ...(state.settings.apiKey ? [{ id: "speaking", label: "דיבור", Icon: Mic }] : []),
     { id: "settings", label: "הגדרות", Icon: SettingsIcon },
   ];
@@ -1695,6 +2431,8 @@ export default function App() {
               setLanguage={setLanguage}
               dueCount={dueCount}
               newCount={newCount}
+              chunkDue={dueChunks(langData.chunks || {}, todayStr()).length}
+              chunkTotal={Object.keys(langData.chunks || {}).length}
               onGo={goTab}
             />
           )}
@@ -1750,9 +2488,24 @@ export default function App() {
 
           {tab === "settings" && <Settings state={state} onSave={saveApiKey} />}
 
+          {tab === "chunks" && state.settings.apiKey && (
+            <ChunkPractice
+              key={currentLang + levelFilter}
+              lang={currentLang}
+              level={levelFilter}
+              apiKey={state.settings.apiKey}
+              chunks={langData.chunks || {}}
+              onSave={saveChunks}
+              onFinish={finishChunkSession}
+              onBack={() => goTab("home")}
+            />
+          )}
+
           {tab === "speaking" && state.settings.apiKey && (
             <SpeakingPractice
               key={currentLang + levelFilter}
+              chunks={langData.chunks || {}}
+              onChunksUsed={markChunksUsed}
               level={levelFilter}
               lang={currentLang}
               apiKey={state.settings.apiKey}
