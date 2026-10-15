@@ -537,6 +537,142 @@ async function saveState(state) {
   }
 }
 
+/* ============================== BACKUP ============================== */
+
+const BACKUP_META_KEY = "app-backup-meta";
+
+function readBackupMeta() {
+  try {
+    return JSON.parse(localStorage.getItem(BACKUP_META_KEY) || "null") || {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function markBackup() {
+  try {
+    localStorage.setItem(BACKUP_META_KEY, JSON.stringify({ last: todayStr() }));
+  } catch (e) { /* noop */ }
+}
+
+function daysSinceBackup() {
+  const last = readBackupMeta().last;
+  if (!last) return null;
+  const [y, m, d] = last.split("-").map(Number);
+  const [ty, tm, td] = todayStr().split("-").map(Number);
+  return Math.round((new Date(ty, tm - 1, td) - new Date(y, m - 1, d)) / 86400000);
+}
+
+// the API key is deliberately left out of backups, so a shared backup file never leaks it
+function buildBackup(state) {
+  const safe = { ...state, settings: { ...state.settings, apiKey: "" } };
+  return JSON.stringify({ app: "speakup", version: 1, exportedAt: new Date().toISOString(), state: safe }, null, 1);
+}
+
+function parseBackup(text) {
+  const obj = JSON.parse(text);
+  if (!obj || obj.app !== "speakup" || !obj.state || !obj.state.langData) throw new Error("זה לא קובץ גיבוי של SpeakUp");
+  return migrateState(obj.state);
+}
+
+function downloadFile(name, text, mime = "application/json") {
+  const blob = new Blob([text], { type: mime + ";charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+function backupFileName() {
+  return `speakup-backup-${todayStr()}.json`;
+}
+
+function csvCell(v) {
+  return `"${String(v ?? "").replace(/"/g, '""')}"`;
+}
+
+function chunksToCsv(bank) {
+  const rows = [["צירוף", "תרגום", "משפט דוגמה", "תרגום המשפט", "נושא", "מצב"]];
+  Object.values(bank || {}).forEach((c) => rows.push([c.text, c.he, c.ex, c.exHe, c.topic, chunkStatus(c).label]));
+  return "﻿" + rows.map((r) => r.map(csvCell).join(",")).join("\r\n");
+}
+
+// --- optional silent auto-backup into a file the user picked once (desktop Chrome/Edge only) ---
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    const r = indexedDB.open("speakup-backup", 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("kv");
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
+async function idbGet(key) {
+  const db = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const q = db.transaction("kv").objectStore("kv").get(key);
+    q.onsuccess = () => resolve(q.result);
+    q.onerror = () => reject(q.error);
+  });
+}
+async function idbSet(key, val) {
+  const db = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction("kv", "readwrite");
+    if (val === undefined) tx.objectStore("kv").delete(key);
+    else tx.objectStore("kv").put(val, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+const canAutoFileBackup = () => typeof window !== "undefined" && !!window.showSaveFilePicker && !!window.indexedDB;
+
+async function connectBackupFile(state) {
+  const handle = await window.showSaveFilePicker({
+    suggestedName: "speakup-backup.json",
+    types: [{ description: "SpeakUp backup", accept: { "application/json": [".json"] } }],
+  });
+  await idbSet("fileHandle", handle);
+  await writeBackupFile(state);
+  return handle.name;
+}
+
+async function disconnectBackupFile() {
+  await idbSet("fileHandle", undefined);
+}
+
+async function connectedBackupName() {
+  try {
+    if (!canAutoFileBackup()) return null;
+    const h = await idbGet("fileHandle");
+    return h ? h.name : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function writeBackupFile(state) {
+  try {
+    if (!canAutoFileBackup()) return "unsupported";
+    const h = await idbGet("fileHandle");
+    if (!h) return "none";
+    let perm = await h.queryPermission({ mode: "readwrite" });
+    if (perm !== "granted") perm = await h.requestPermission({ mode: "readwrite" });
+    if (perm !== "granted") return "denied";
+    const w = await h.createWritable();
+    await w.write(buildBackup(state));
+    await w.close();
+    markBackup();
+    return "ok";
+  } catch (e) {
+    return "error";
+  }
+}
+
 /* ============================== GEMINI AI ============================== */
 
 async function callGemini(apiKey, prompt) {
@@ -943,6 +1079,7 @@ function GlobalStyle() {
       }
       .ela-micbtn.listening { background: var(--rose); animation: ela-pulse 1.4s ease-in-out infinite; }
       .ela-micbtn:disabled { opacity: 0.5; cursor: default; }
+      @keyframes ela-gap { from { width: 0; } to { width: 100%; } }
       @keyframes ela-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(193,85,74,0.4); } 50% { box-shadow: 0 0 0 14px rgba(193,85,74,0); } }
 
       .ela-transcriptbox {
@@ -957,7 +1094,7 @@ function GlobalStyle() {
 
 /* ============================== HOME VIEW ============================== */
 
-function Home({ state, langData, currentLang, setLevel, setLanguage, dueCount, newCount, chunkDue, chunkTotal, onGo }) {
+function Home({ state, langData, currentLang, setLevel, setLanguage, dueCount, newCount, chunkDue, chunkTotal, backupStale, onGo }) {
   const doneToday = state.stats.lastActiveDate === todayStr();
   const aiOn = !!state.settings.apiKey;
   const langInfo = languageInfo(currentLang);
@@ -987,6 +1124,12 @@ function Home({ state, langData, currentLang, setLevel, setLanguage, dueCount, n
       {!langInfo.hasLocalContent && !aiOn && (
         <div className="ela-note" style={{ background: "var(--rose-light)", color: "var(--rose)", borderRadius: 12, padding: "10px 12px", marginBottom: 4 }}>
           לימוד {langInfo.label} דורש חיבור ל-AI. עברו להגדרות והוסיפו מפתח Gemini כדי להתחיל.
+        </div>
+      )}
+
+      {backupStale && (
+        <div className="ela-note" style={{ background: "var(--gold-light)", color: "#8A6412", borderRadius: 12, padding: "10px 12px", margin: "12px 0", cursor: "pointer" }} onClick={() => onGo("settings")}>
+          כדאי לגבות את ההתקדמות שלך - לחצו כאן להגדרות הגיבוי.
         </div>
       )}
 
@@ -1366,11 +1509,74 @@ function ConvoPlayer({ dialogue, speechLang, onBack, onComplete, done }) {
 
 /* ============================== SETTINGS VIEW ============================== */
 
-function Settings({ state, onSave }) {
+function Settings({ state, onSave, onRestore, onBackedUp }) {
   const [value, setValue] = useState(state.settings.apiKey || "");
   const [show, setShow] = useState(false);
   const [status, setStatus] = useState(null); // { ok: bool, msg }
   const [checking, setChecking] = useState(false);
+  const [bkMsg, setBkMsg] = useState(null); // { ok, msg }
+  const [fileName, setFileName] = useState(null);
+  const [days, setDays] = useState(daysSinceBackup());
+  const fileInputRef = useRef(null);
+
+  useEffect(() => {
+    connectedBackupName().then(setFileName);
+  }, []);
+
+  function backedUp() {
+    markBackup();
+    setDays(daysSinceBackup());
+    if (onBackedUp) onBackedUp();
+  }
+
+  async function downloadBackup() {
+    const text = buildBackup(state);
+    try {
+      const file = new File([text], backupFileName(), { type: "application/json" });
+      if (navigator.canShare && navigator.canShare({ files: [file] }) && /Android|iPhone|iPad/i.test(navigator.userAgent)) {
+        await navigator.share({ files: [file], title: "SpeakUp backup" });
+        backedUp();
+        setBkMsg({ ok: true, msg: "הגיבוי נשלח לשמירה. מומלץ לבחור Google Drive או 'שמירה בקבצים'." });
+        return;
+      }
+    } catch (e) {
+      if (e && e.name === "AbortError") return;
+    }
+    downloadFile(backupFileName(), text);
+    backedUp();
+    setBkMsg({ ok: true, msg: "הגיבוי הורד לתיקיית ההורדות." });
+  }
+
+  async function connectFile() {
+    try {
+      const name = await connectBackupFile(state);
+      setFileName(name);
+      backedUp();
+      setBkMsg({ ok: true, msg: `מחובר. בסיום כל תרגול הגיבוי יתעדכן אוטומטית בקובץ ${name}.` });
+    } catch (e) {
+      if (!e || e.name !== "AbortError") setBkMsg({ ok: false, msg: "לא הצלחנו לחבר קובץ גיבוי." });
+    }
+  }
+
+  async function disconnectFile() {
+    await disconnectBackupFile();
+    setFileName(null);
+    setBkMsg({ ok: true, msg: "החיבור לקובץ הגיבוי בוטל." });
+  }
+
+  async function onPickRestore(e) {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!f) return;
+    try {
+      const restored = parseBackup(await f.text());
+      if (!window.confirm("השחזור יחליף את ההתקדמות הנוכחית במכשיר הזה בנתוני הגיבוי. להמשיך?")) return;
+      onRestore(restored);
+      setBkMsg({ ok: true, msg: "ההתקדמות שוחזרה בהצלחה." });
+    } catch (err) {
+      setBkMsg({ ok: false, msg: err.message || "קובץ הגיבוי לא תקין." });
+    }
+  }
 
   async function testKey(key) {
     setChecking(true);
@@ -1420,6 +1626,30 @@ function Settings({ state, onSave }) {
         המפתח נשמר רק בדפדפן הזה (localStorage) ונשלח ישירות מהדפדפן ל-Google לצורך יצירת התרגילים — הוא לא עובר דרך שום שרת אחר.
         אפשר ליצור מפתח בחינם באתר Google AI Studio.
       </p>
+
+      <h2 className="ela-h1" style={{ fontSize: 20, marginTop: 30 }}>גיבוי ושחזור</h2>
+      <p className="ela-sub" style={{ marginBottom: 12 }}>
+        ההתקדמות (מילים, צ'אנקים, חזרות) שמורה בדפדפן בלבד. גיבוי מגן עליה אם מנקים נתוני אתר או מחליפים מכשיר. מפתח ה-AI לא נכלל בגיבוי.
+      </p>
+      <p className="ela-note" style={{ marginTop: 0 }}>
+        {days === null ? "עדיין לא בוצע גיבוי." : days === 0 ? "הגיבוי האחרון: היום." : `הגיבוי האחרון: לפני ${days} ימים.`}
+      </p>
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+        <button className="ela-btn" onClick={downloadBackup}>גיבוי עכשיו</button>
+        <button className="ela-btn secondary" onClick={() => fileInputRef.current && fileInputRef.current.click()}>שחזור מקובץ</button>
+        {canAutoFileBackup() && !fileName && (
+          <button className="ela-btn secondary" onClick={connectFile}>גיבוי אוטומטי לקובץ</button>
+        )}
+        {fileName && <button className="ela-btn secondary" onClick={disconnectFile}>ניתוק גיבוי אוטומטי</button>}
+      </div>
+      <input ref={fileInputRef} type="file" accept=".json,application/json" style={{ display: "none" }} onChange={onPickRestore} />
+      {fileName && (
+        <div className="ela-note">גיבוי אוטומטי פעיל לקובץ <b>{fileName}</b> - מתעדכן בסיום כל תרגול (הדפדפן עשוי לבקש אישור פעם בכל הפעלה).</div>
+      )}
+      {!canAutoFileBackup() && (
+        <div className="ela-note">בטלפון אין גיבוי אוטומטי לקובץ (מגבלה של הדפדפן), לכן יופיע תזכורת בדף הבית כשעבר זמן מהגיבוי האחרון.</div>
+      )}
+      {bkMsg && <div className={bkMsg.ok ? "ela-note" : "ela-errbox"} style={{ marginTop: 10 }}>{bkMsg.msg}</div>}
     </div>
   );
 }
@@ -2026,6 +2256,149 @@ function ChunkStep({ step, chunk, lang, level, apiKey, langInfo, onResult }) {
   );
 }
 
+function speakWait(text, lang) {
+  return new Promise((resolve) => {
+    try {
+      if (!window.speechSynthesis || !text) return resolve();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = lang;
+      u.rate = 0.92;
+      const v = pickVoice(lang);
+      if (v) u.voice = v;
+      let done = false;
+      const finish = () => { if (!done) { done = true; clearTimeout(t); resolve(); } };
+      // some browsers never fire onend - never let the loop hang
+      const t = setTimeout(finish, 6000 + text.length * 160);
+      u.onend = finish;
+      u.onerror = finish;
+      window.speechSynthesis.speak(u);
+    } catch (e) {
+      resolve();
+    }
+  });
+}
+
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Hands-free listening: Hebrew prompt -> a pause to say it aloud -> the chunk -> its example sentence.
+function ChunkListen({ chunks, lang, onBack }) {
+  const langInfo = languageInfo(lang);
+  const [queue] = useState(() => {
+    const t = todayStr();
+    const learned = Object.values(chunks || {}).filter((c) => (c.stage || 0) >= 1);
+    const dueIds = new Set(dueChunks(chunks || {}, t).map((c) => c.id));
+    const due = shuffle(learned.filter((c) => dueIds.has(c.id)));
+    const rest = shuffle(learned.filter((c) => !dueIds.has(c.id)));
+    return [...due, ...rest].slice(0, 15);
+  });
+  const [i, setI] = useState(0);
+  const [stage, setStage] = useState("idle"); // he | gap | chunk | ex | idle
+  const [playing, setPlaying] = useState(true);
+  const [gapSec, setGapSec] = useState(5);
+  const [finished, setFinished] = useState(false);
+  const wakeRef = useRef(null);
+
+  useEffect(() => {
+    try {
+      if (navigator.wakeLock) navigator.wakeLock.request("screen").then((l) => { wakeRef.current = l; }).catch(() => {});
+    } catch (e) { /* noop */ }
+    return () => {
+      try { wakeRef.current && wakeRef.current.release(); } catch (e) { /* noop */ }
+      try { window.speechSynthesis && window.speechSynthesis.cancel(); } catch (e) { /* noop */ }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!playing || finished || !queue[i]) return undefined;
+    let cancelled = false;
+    const c = queue[i];
+    (async () => {
+      setStage("he");
+      await speakWait(c.he, "he-IL");
+      if (cancelled) return;
+      setStage("gap");
+      await sleepMs(gapSec * 1000);
+      if (cancelled) return;
+      setStage("chunk");
+      await speakWait(c.text, langInfo.speechLang);
+      if (cancelled) return;
+      await sleepMs(1200);
+      if (cancelled) return;
+      if (c.ex) {
+        setStage("ex");
+        await speakWait(c.ex, langInfo.speechLang);
+        if (cancelled) return;
+        await sleepMs(900);
+        if (cancelled) return;
+      }
+      if (i + 1 >= queue.length) { setFinished(true); setStage("idle"); }
+      else setI(i + 1);
+    })();
+    return () => {
+      cancelled = true;
+      try { window.speechSynthesis.cancel(); } catch (e) { /* noop */ }
+    };
+  }, [i, playing, gapSec, finished]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (!queue.length) {
+    return (
+      <div>
+        <BackRow onBack={onBack} />
+        <p className="ela-sub">עדיין אין צ'אנקים להאזנה. למדו קודם כמה צ'אנקים חדשים.</p>
+      </div>
+    );
+  }
+
+  if (finished) {
+    return (
+      <div style={{ textAlign: "center", paddingTop: 20 }}>
+        <Sparkles size={30} color="var(--gold)" />
+        <h1 className="ela-h1" style={{ marginTop: 12 }}>סיימתם סבב האזנה</h1>
+        <div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 16 }}>
+          <button className="ela-btn secondary" onClick={() => { setI(0); setFinished(false); setPlaying(true); }}>עוד סבב</button>
+          <button className="ela-btn" onClick={onBack}>חזרה</button>
+        </div>
+      </div>
+    );
+  }
+
+  const c = queue[i];
+  return (
+    <div>
+      <BackRow onBack={onBack} label="סיום האזנה" />
+      <div className="ela-progressbar"><div style={{ width: `${(i / queue.length) * 100}%` }} /></div>
+      <div className="ela-flashcard" style={{ cursor: "default" }}>
+        <div className="hint">{i + 1} מתוך {queue.length}</div>
+        <div className="translation" style={{ fontSize: 26 }}>{c.he}</div>
+        {stage === "gap" && (
+          <>
+            <div className="hint">עכשיו אמרו בקול...</div>
+            <div style={{ width: 200, height: 6, background: "var(--mist)", borderRadius: 999, overflow: "hidden" }}>
+              <div key={i + "gap"} style={{ height: "100%", background: "var(--sage)", animation: `ela-gap ${gapSec}s linear forwards` }} />
+            </div>
+          </>
+        )}
+        {(stage === "chunk" || stage === "ex") && <div className="word" style={{ fontSize: 30 }}>{c.text}</div>}
+        {stage === "ex" && c.ex && <div className="example">{c.ex}</div>}
+      </div>
+      <div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 18, flexWrap: "wrap" }}>
+        <button className="ela-btn secondary" disabled={i === 0} onClick={() => setI(i - 1)}>הקודם</button>
+        <button className="ela-btn" onClick={() => setPlaying((p) => !p)}>{playing ? "השהיה" : "המשך"}</button>
+        <button className="ela-btn secondary" onClick={() => (i + 1 >= queue.length ? setFinished(true) : setI(i + 1))}>הבא</button>
+      </div>
+      <p className="ela-sub" style={{ textAlign: "center", marginTop: 18, marginBottom: 6 }}>זמן להשלמה בקול:</p>
+      <div className="ela-chiprow" style={{ justifyContent: "center" }}>
+        {[3, 5, 8].map((n) => (
+          <button key={n} className={"ela-chip" + (gapSec === n ? " active" : "")} onClick={() => setGapSec(n)}>{n} שניות</button>
+        ))}
+      </div>
+      <p className="ela-note" style={{ textAlign: "center" }}>
+        ההאזנה עובדת כשהמסך דולק והאפליקציה פתוחה. זה תרגול שליפה פסיבי - ההתקדמות בחזרות לא משתנה.
+      </p>
+    </div>
+  );
+}
+
 function ChunkPractice({ lang, level, apiKey, chunks, onSave, onFinish, onBack }) {
   const langInfo = languageInfo(lang);
   const effectiveLevel = level === "all" ? "intermediate" : level;
@@ -2115,6 +2488,10 @@ function ChunkPractice({ lang, level, apiKey, chunks, onSave, onFinish, onBack }
     );
   }
 
+  if (view === "listen") {
+    return <ChunkListen chunks={bankRef.current} lang={lang} onBack={() => setView("menu")} />;
+  }
+
   if (view === "session") {
     const step = steps[idx];
     const chunk = bankRef.current[step.id];
@@ -2173,6 +2550,14 @@ function ChunkPractice({ lang, level, apiKey, chunks, onSave, onFinish, onBack }
         </div>
       )}
 
+      {all.some((c) => (c.stage || 0) >= 1) && (
+        <div className="ela-bigcard" style={{ marginBottom: 16 }} onClick={() => setView("listen")}>
+          <div className="icon-wrap" style={{ background: "var(--gold-light)", color: "#8A6412" }}><Volume2 size={22} /></div>
+          <h3>מצב האזנה</h3>
+          <p>האפליקציה אומרת את העברית, אתם משלימים בקול, והיא משמיעה את הצירוף. מתאים להליכה או לנסיעה.</p>
+        </div>
+      )}
+
       <p className="ela-sub" style={{ marginBottom: 10, fontWeight: 600 }}>צ'אנקים חדשים - בחרו נושא או כתבו משלכם:</p>
       <div className="ela-fieldrow" style={{ marginBottom: 14 }}>
         <input
@@ -2187,6 +2572,7 @@ function ChunkPractice({ lang, level, apiKey, chunks, onSave, onFinish, onBack }
       {all.length > 0 && (
         <div style={{ marginTop: 22 }}>
           <button className="ela-chip" onClick={() => setShowList((v) => !v)}>{showList ? "הסתר את הצ'אנקים שלי" : "הצ'אנקים שלי"}</button>
+          <button className="ela-chip" style={{ marginRight: 8 }} onClick={() => downloadFile(`speakup-chunks-${lang}-${todayStr()}.csv`, chunksToCsv(bankRef.current), "text/csv")}>ייצוא לקובץ (CSV)</button>
           {showList && (
             <div style={{ marginTop: 10 }}>
               {[...all].reverse().slice(0, 60).map((c) => (
@@ -2233,6 +2619,7 @@ export default function App() {
   const [vocabPhase, setVocabPhase] = useState("session");
   const [lastResults, setLastResults] = useState([]);
   const [levelSuggestion, setLevelSuggestion] = useState(null);
+  const [backupTick, setBackupTick] = useState(0);
 
   useEffect(() => {
     (async () => {
@@ -2246,6 +2633,22 @@ export default function App() {
     setState(next);
     saveState(next);
   }, []);
+
+  // ask the browser not to evict our saved progress under storage pressure
+  useEffect(() => {
+    try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch (e) { /* noop */ }
+  }, []);
+
+  // after every completed practice session, refresh the auto-backup file (if one was connected)
+  const prevSessionsRef = useRef(null);
+  useEffect(() => {
+    if (!state) return;
+    const n = state.stats.sessionsCompleted;
+    if (prevSessionsRef.current !== null && n > prevSessionsRef.current) {
+      writeBackupFile(state).then((r) => { if (r === "ok") setBackupTick((t) => t + 1); });
+    }
+    prevSessionsRef.current = n;
+  }, [state]);
 
   if (loading || !state) {
     return (
@@ -2433,6 +2836,7 @@ export default function App() {
               newCount={newCount}
               chunkDue={dueChunks(langData.chunks || {}, todayStr()).length}
               chunkTotal={Object.keys(langData.chunks || {}).length}
+              backupStale={state.stats.sessionsCompleted >= 3 && (() => { const d = daysSinceBackup(); return d === null || d >= 7; })()}
               onGo={goTab}
             />
           )}
@@ -2486,7 +2890,14 @@ export default function App() {
             />
           )}
 
-          {tab === "settings" && <Settings state={state} onSave={saveApiKey} />}
+          {tab === "settings" && (
+            <Settings
+              state={state}
+              onSave={saveApiKey}
+              onRestore={(restored) => persist({ ...restored, onboarded: true, settings: { ...restored.settings, apiKey: state.settings.apiKey } })}
+              onBackedUp={() => setBackupTick((t) => t + 1)}
+            />
+          )}
 
           {tab === "chunks" && state.settings.apiKey && (
             <ChunkPractice
