@@ -949,6 +949,7 @@ function GlobalStyle() {
         font-size: 13.5px; font-weight: 600; border: 1px solid var(--mist);
         background: var(--card); color: var(--muted); cursor: pointer;
       }
+      .ela-chip.util { border: 1.5px solid var(--gold); background: var(--gold-light); color: #8A6412; }
       .ela-chip.active { background: var(--ink); color: var(--paper); border-color: var(--ink); }
       .ela-chiprow { display: flex; gap: 8px; flex-wrap: wrap; margin: 14px 0 6px 0; }
 
@@ -2110,7 +2111,6 @@ function ChunkStep({ step, chunk, lang, level, apiKey, langInfo, onResult }) {
 
   const mic = useHoldToTalk(langInfo.speechLang, (t) => {
     setHeard(t);
-    if (step.type === "retrieve") setRevealed(true);
     if (step.type === "use") setTyped(t);
   });
 
@@ -2166,7 +2166,18 @@ function ChunkStep({ step, chunk, lang, level, apiKey, langInfo, onResult }) {
           )}
         </div>
         <div style={{ marginTop: 18, display: "flex", flexDirection: "column", alignItems: "center", gap: 12 }}>
-          {!revealed ? (
+          {!revealed && heard ? (
+            <>
+              <div className="ela-correction" style={{ width: "100%", textAlign: "center" }}>
+                <div className="label">זה מה ששמענו</div>
+                <div className="fixed" dir="ltr">“{heard}”</div>
+              </div>
+              <div style={{ display: "flex", gap: 10 }}>
+                <button className="ela-btn secondary" onClick={() => { setHeard(""); setTyped(""); }}><RotateCcw size={15} />הקלטה מחדש</button>
+                <button className="ela-btn" onClick={() => setRevealed(true)}>בדיקה</button>
+              </div>
+            </>
+          ) : !revealed ? (
             <>
               {mic.supported && !typing && <HoldMic mic={mic} label="החזיקו ואמרו את הצ'אנק" />}
               {(!mic.supported || typing) && (
@@ -2570,11 +2581,11 @@ function ChunkPractice({ lang, level, apiKey, chunks, onSave, onFinish, onBack }
       <div className="ela-chiprow">{TOPICS.map(topicBtn)}</div>
 
       {all.length > 0 && (
-        <div style={{ marginTop: 22 }}>
-          <button className="ela-chip" onClick={() => setShowList((v) => !v)}>{showList ? "הסתר את הצ'אנקים שלי" : "הצ'אנקים שלי"}</button>
-          <button className="ela-chip" style={{ marginRight: 8 }} onClick={() => downloadFile(`speakup-chunks-${lang}-${todayStr()}.csv`, chunksToCsv(bankRef.current), "text/csv")}>ייצוא לקובץ (CSV)</button>
+        <div style={{ marginTop: 22, display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button className="ela-chip util" onClick={() => setShowList((v) => !v)}>{showList ? "הסתר את הצ'אנקים שלי" : "הצ'אנקים שלי"}</button>
+          <button className="ela-chip util" onClick={() => downloadFile(`speakup-chunks-${lang}-${todayStr()}.csv`, chunksToCsv(bankRef.current), "text/csv")}>ייצוא לקובץ (CSV)</button>
           {showList && (
-            <div style={{ marginTop: 10 }}>
+            <div style={{ marginTop: 4, width: "100%" }}>
               {[...all].reverse().slice(0, 60).map((c) => (
                 <div key={c.id} className="ela-optbtn" style={{ cursor: "default", display: "flex", justifyContent: "space-between", gap: 8 }}>
                   <span dir="ltr" style={{ textAlign: "left" }}>{c.text}</span>
