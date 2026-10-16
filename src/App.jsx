@@ -1991,7 +1991,7 @@ function SpeakingPractice({ level, lang, apiKey, recentFocus, chunks, onChunksUs
 /* ============================== CHUNKS ============================== */
 
 // Hold-to-talk speech capture (same behaviour as the speaking practice, packaged for reuse).
-function useHoldToTalk(speechLang, onFinish, expected) {
+function useHoldToTalk(speechLang, onFinish) {
   const [phase, setPhase] = useState("idle"); // idle | starting | listening
   const [error, setError] = useState(null);
   const recRef = useRef(null);
@@ -2000,8 +2000,6 @@ function useHoldToTalk(speechLang, onFinish, expected) {
   const stopScheduledRef = useRef(false);
   const finishRef = useRef(onFinish);
   finishRef.current = onFinish;
-  const expectedRef = useRef(expected);
-  expectedRef.current = expected;
   const supported = !!getSpeechRecognition();
 
   useEffect(() => {
@@ -2023,27 +2021,15 @@ function useHoldToTalk(speechLang, onFinish, expected) {
     if (!rec) return;
     recRef.current = rec;
     rec.lang = speechLang;
-    // short phrases: single-utterance mode with interim results (keeps the latest guess even if the
-    // engine never marks it final) and several alternatives, so the one closest to the expected chunk can win
-    rec.continuous = false;
-    rec.interimResults = true;
-    rec.maxAlternatives = expectedRef.current ? 5 : 1;
+    rec.continuous = true;
+    rec.interimResults = false;
+    rec.maxAlternatives = 1;
     let sessionFinal = "";
     rec.onaudiostart = () => setPhase((p) => (p === "starting" ? "listening" : p));
     rec.onresult = (event) => {
       let parts = [];
       for (let i = 0; i < event.results.length; i++) {
-        const alts = Array.from(event.results[i]).map((a) => (a.transcript || "").trim()).filter(Boolean);
-        if (!alts.length) continue;
-        let t = alts[0];
-        const exp = expectedRef.current;
-        if (exp && alts.length > 1) {
-          let best = chunkMatch(exp, t);
-          alts.slice(1).forEach((a) => {
-            const m = chunkMatch(exp, a);
-            if (m > best) { best = m; t = a; }
-          });
-        }
+        const t = (event.results[i][0].transcript || "").trim();
         if (!t) continue;
         const joined = parts.join(" ");
         if (joined && t.toLowerCase().startsWith(joined.toLowerCase())) parts = [t];
@@ -2123,14 +2109,10 @@ function ChunkStep({ step, chunk, lang, level, apiKey, langInfo, onResult }) {
   const [fb, setFb] = useState(null);
   const [err, setErr] = useState(null);
 
-  const mic = useHoldToTalk(
-    langInfo.speechLang,
-    (t) => {
-      setHeard(t);
-      if (step.type === "use") setTyped(t);
-    },
-    step.type === "retrieve" ? chunk.text : null
-  );
+  const mic = useHoldToTalk(langInfo.speechLang, (t) => {
+    setHeard(t);
+    if (step.type === "use") setTyped(t);
+  });
 
   useEffect(() => {
     if (step.type === "recognize") speak(chunk.text, langInfo.speechLang);
