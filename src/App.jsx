@@ -1990,14 +1990,19 @@ function SpeakingPractice({ level, lang, apiKey, recentFocus, chunks, onChunksUs
 
 /* ============================== CHUNKS ============================== */
 
-// Hold-to-talk speech capture (same behaviour as the speaking practice, packaged for reuse).
+// Hold-to-talk speech capture. Mirrors the recognition engine of the translator app, which proved accurate on this phone:
+// continuous + interim results, text = finalized parts + the still-interim tail (so the last words are not lost),
+// a fresh recognizer instance for every (re)start, a grace period after release and a safety timer.
 function useHoldToTalk(speechLang, onFinish) {
   const [phase, setPhase] = useState("idle"); // idle | starting | listening
   const [error, setError] = useState(null);
   const recRef = useRef(null);
   const heldRef = useRef(false);
-  const committedRef = useRef("");
+  const committedRef = useRef(""); // text from earlier recognizer instances in this press
+  const liveRef = useRef(""); // text of the current instance (final + interim)
+  const doneRef = useRef(true);
   const stopScheduledRef = useRef(false);
+  const safetyRef = useRef(null);
   const finishRef = useRef(onFinish);
   finishRef.current = onFinish;
   const supported = !!getSpeechRecognition();
@@ -2005,58 +2010,78 @@ function useHoldToTalk(speechLang, onFinish) {
   useEffect(() => {
     return () => {
       heldRef.current = false;
+      clearTimeout(safetyRef.current);
       try { recRef.current && recRef.current.abort(); } catch (e) { /* noop */ }
     };
   }, []);
 
   function finish() {
+    if (doneRef.current) return;
+    doneRef.current = true;
+    clearTimeout(safetyRef.current);
     setPhase("idle");
-    const text = committedRef.current.trim();
+    const text = (committedRef.current + " " + liveRef.current).trim();
+    committedRef.current = "";
+    liveRef.current = "";
     if (text && finishRef.current) finishRef.current(text);
   }
 
   function launch() {
-    try { recRef.current && recRef.current.abort(); } catch (e) { /* noop */ }
     const rec = getSpeechRecognition();
     if (!rec) return;
     recRef.current = rec;
+    liveRef.current = "";
     rec.lang = speechLang;
     rec.continuous = true;
-    rec.interimResults = false;
-    rec.maxAlternatives = 1;
-    let sessionFinal = "";
+    rec.interimResults = true;
     rec.onaudiostart = () => setPhase((p) => (p === "starting" ? "listening" : p));
     rec.onresult = (event) => {
-      let parts = [];
+      // some Android engines resend cumulative finals: replace when a final extends what we have, ignore stale ones
+      let finalPart = "";
+      let interimPart = "";
       for (let i = 0; i < event.results.length; i++) {
         const t = (event.results[i][0].transcript || "").trim();
         if (!t) continue;
-        const joined = parts.join(" ");
-        if (joined && t.toLowerCase().startsWith(joined.toLowerCase())) parts = [t];
-        else if (!joined.toLowerCase().includes(t.toLowerCase())) parts.push(t);
+        if (event.results[i].isFinal) {
+          if (!finalPart || t.startsWith(finalPart)) finalPart = t;
+          else if (finalPart.startsWith(t)) { /* stale shorter duplicate */ }
+          else finalPart = (finalPart + " " + t).trim();
+        } else {
+          interimPart = (interimPart + " " + t).trim();
+        }
       }
-      sessionFinal = parts.join(" ");
+      liveRef.current = (finalPart + " " + interimPart).trim();
     };
     rec.onerror = (event) => {
-      if (event.error === "not-allowed") {
+      if (event.error === "not-allowed" || event.error === "service-not-allowed") {
         heldRef.current = false;
         setError("הגישה למיקרופון נחסמה. אשרו הרשאת מיקרופון בדפדפן ונסו שוב.");
+        doneRef.current = true;
         setPhase("idle");
       }
     };
     rec.onend = () => {
-      if (sessionFinal) committedRef.current = (committedRef.current + " " + sessionFinal).trim();
-      if (heldRef.current) launch();
-      else finish();
+      if (recRef.current !== rec) return; // an old instance, ignore
+      if (heldRef.current) {
+        // the engine stopped on its own (pause) while the button is still held: keep what we have, start a new instance
+        committedRef.current = (committedRef.current + " " + liveRef.current).trim();
+        liveRef.current = "";
+        launch();
+      } else {
+        finish();
+      }
     };
     try { rec.start(); } catch (e) { /* start() can throw if called too quickly */ }
   }
 
   function startHold() {
     if (heldRef.current) return;
+    try { recRef.current && recRef.current.abort(); } catch (e) { /* noop */ }
     stopScheduledRef.current = false;
     heldRef.current = true;
+    doneRef.current = false;
     committedRef.current = "";
+    liveRef.current = "";
     setError(null);
     setPhase("starting");
     launch();
@@ -2069,7 +2094,10 @@ function useHoldToTalk(speechLang, onFinish) {
       stopScheduledRef.current = false;
       heldRef.current = false;
       try { recRef.current && recRef.current.stop(); } catch (e) { finish(); }
-    }, 400); // grace period so the last word isn't clipped
+      // safety net: if the engine never reports its end, finish with what we have
+      clearTimeout(safetyRef.current);
+      safetyRef.current = setTimeout(finish, 1500);
+    }, 500); // grace period so the last word isn't clipped
   }
 
   return { phase, error, supported, startHold, stopHold };
