@@ -1059,6 +1059,14 @@ function GlobalStyle() {
       .ela-correction .fixed { font-family: 'Fraunces', serif; direction: ltr; text-align: left; color: #6B4A0C; }
       .ela-correction .fb { color: #6B4A0C; margin-top: 4px; }
 
+      .ela-heardbox { background: var(--card); border: 1px solid var(--mist); border-radius: 12px; padding: 10px 12px; width: 100%; font-size: 13px; }
+      .ela-heardbox .label { font-weight: 700; color: var(--muted); font-size: 11.5px; margin-bottom: 3px; }
+      .ela-heardbox .heard { font-family: 'Fraunces', serif; direction: ltr; text-align: left; font-size: 16px; color: var(--ink); }
+      .ela-heardbox.ok { border-color: var(--sage); background: var(--sage-light); }
+      .ela-heardbox.ok .label, .ela-heardbox.ok .heard { color: var(--sage); }
+      .ela-heardbox.miss { border-color: var(--rose); background: var(--rose-light); }
+      .ela-heardbox.miss .label, .ela-heardbox.miss .heard { color: var(--rose); }
+
       .ela-hintrow { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 2px 0; }
       .ela-hintchip {
         font-size: 12px; background: var(--sage-light); color: var(--sage);
@@ -1667,11 +1675,15 @@ function SpeakingPractice({ level, lang, apiKey, recentFocus, chunks, onChunksUs
   const [transcript, setTranscript] = useState("");
   const [error, setError] = useState(null);
   const [showHint, setShowHint] = useState(false);
+  // recording through Gemini (literal transcription) when the browser can record audio; otherwise the browser's recognizer
+  const useGemini = !!apiKey && geminiMicSupported();
+  const gMic = useGeminiHoldToTalk(apiKey, languageInfo(lang).label, (t) => { setTranscript(t); setPhase("reviewing"); }, useGemini, false);
+  const micPhase = useGemini ? gMic.phase : phase;
   const recRef = useRef(null);
   const isHeldRef = useRef(false);
   const committedTextRef = useRef("");
   const stopScheduledRef = useRef(false);
-  const speechSupported = !!getSpeechRecognition();
+  const speechSupported = !!getSpeechRecognition() || (!!apiKey && geminiMicSupported());
   const langInfo = languageInfo(lang);
 
   useEffect(() => {
@@ -1689,6 +1701,7 @@ function SpeakingPractice({ level, lang, apiKey, recentFocus, chunks, onChunksUs
   }
 
   async function startTopic(t) {
+    if (useGemini) gMic.prepare(); // open the microphone now (a click), so the first press is instant
     setTopic(t);
     setPhase("loading");
     setError(null);
@@ -1921,6 +1934,7 @@ function SpeakingPractice({ level, lang, apiKey, recentFocus, chunks, onChunksUs
       )}
 
       {error && phase === "ready" && <div className="ela-errbox">{error}</div>}
+      {useGemini && gMic.error && (phase === "ready" || phase === "reviewing") && <div className="ela-errbox">{gMic.error}</div>}
 
       <div className="ela-speakbar">
         {phase === "reviewing" ? (
@@ -1944,18 +1958,18 @@ function SpeakingPractice({ level, lang, apiKey, recentFocus, chunks, onChunksUs
         ) : speechSupported ? (
           <>
             <button
-              className={"ela-micbtn" + (phase === "listening" || phase === "starting" ? " listening" : "")}
-              disabled={phase === "sending" || phase === "loading"}
-              onPointerDown={(e) => { e.preventDefault(); startHold(); }}
-              onPointerUp={stopHold}
-              onPointerLeave={stopHold}
-              onPointerCancel={stopHold}
+              className={"ela-micbtn" + (micPhase === "listening" || micPhase === "starting" ? " listening" : "")}
+              disabled={phase === "sending" || phase === "loading" || micPhase === "processing"}
+              onPointerDown={(e) => { e.preventDefault(); (useGemini ? gMic.startHold : startHold)(); }}
+              onPointerUp={useGemini ? gMic.stopHold : stopHold}
+              onPointerLeave={useGemini ? gMic.stopHold : stopHold}
+              onPointerCancel={useGemini ? gMic.stopHold : stopHold}
               onContextMenu={(e) => e.preventDefault()}
             >
               <Mic size={26} />
             </button>
             <span style={{ fontSize: 12.5, color: "var(--muted)" }}>
-              {phase === "starting" ? "מתחברים למיקרופון..." : phase === "listening" ? "מקליט... דברו, שחררו כשסיימתם" : "לחצו והחזיקו כדי לדבר"}
+              {micPhase === "starting" ? "מתחברים למיקרופון..." : micPhase === "listening" ? "מקליט... דברו, שחררו כשסיימתם" : micPhase === "processing" ? "מתמללים..." : "לחצו והחזיקו כדי לדבר"}
             </span>
             {phase === "ready" && (
               <button
@@ -2180,7 +2194,7 @@ const geminiMicSupported = () =>
   typeof navigator !== "undefined" && !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) && typeof window !== "undefined" && !!window.MediaRecorder;
 
 // Hold-to-talk that records audio and sends it to Gemini. Same interface as useHoldToTalk, plus the "processing" phase.
-function useGeminiHoldToTalk(apiKey, langLabel, onFinish, enabled) {
+function useGeminiHoldToTalk(apiKey, langLabel, onFinish, enabled, prewarm = true) {
   const [phase, setPhase] = useState("idle"); // idle | starting | listening | processing
   const [error, setError] = useState(null);
   const heldRef = useRef(false);
@@ -2211,7 +2225,7 @@ function useGeminiHoldToTalk(apiKey, langLabel, onFinish, enabled) {
   useEffect(() => {
     aliveRef.current = true;
     // open the microphone ahead of the first press so the first words are not clipped
-    if (enabled) getStream().catch(() => {});
+    if (enabled && prewarm) getStream().catch(() => {});
     return () => {
       aliveRef.current = false;
       heldRef.current = false;
@@ -2307,7 +2321,7 @@ function useGeminiHoldToTalk(apiKey, langLabel, onFinish, enabled) {
     }, 500); // grace period so the last word isn't clipped
   }
 
-  return { phase, error, supported: enabled, startHold, stopHold };
+  return { phase, error, supported: enabled, startHold, stopHold, prepare: () => getStream().catch(() => {}) };
 }
 
 function HoldMic({ mic, label }) {
@@ -2397,15 +2411,16 @@ function ChunkStep({ step, chunk, lang, level, apiKey, langInfo, onResult }) {
             <>
               <div className="word" style={{ fontSize: 30 }}>{chunk.text}</div>
               <button className="ela-iconbtn" onClick={() => speak(chunk.text, langInfo.speechLang)} aria-label="השמעה"><Volume2 size={18} /></button>
-              {heard && (
-                <div className="example" style={{ color: good ? "var(--sage)" : "var(--rose)" }}>
-                  {good ? "✓ נשמע שאמרתם: " : "שמענו: "}“{heard}”
-                </div>
-              )}
               {chunk.ex && <div className="example">{chunk.ex}</div>}
             </>
           )}
         </div>
+        {revealed && heard && (
+          <div className={"ela-heardbox " + (good ? "ok" : "miss")} style={{ marginTop: 12 }}>
+            <div className="label">{good ? "✓ מה שנקלט - תואם לצירוף" : "מה שנקלט"}</div>
+            <div className="heard">“{heard}”</div>
+          </div>
+        )}
         <div style={{ marginTop: 18, display: "flex", flexDirection: "column", alignItems: "center", gap: 12 }}>
           {!revealed && heard ? (
             <>
@@ -2494,7 +2509,11 @@ function ChunkStep({ step, chunk, lang, level, apiKey, langInfo, onResult }) {
           </>
         ) : (
           <>
-            <div className="ela-correction" style={{ width: "100%" }}>
+            <div className="ela-heardbox">
+              <div className="label">המשפט שלך</div>
+              <div className="heard">“{typed.trim()}”</div>
+            </div>
+            <div className="ela-correction" style={{ width: "100%", maxWidth: "none" }}>
               <div className="label">{fb.score === 2 ? "מצוין!" : fb.score === 1 ? "כמעט שם" : "ננסה שוב בהמשך"}</div>
               {fb.correction && <div className="fixed">{fb.correction}</div>}
               {fb.feedbackHe && <div className="fb">{fb.feedbackHe}</div>}
