@@ -2105,12 +2105,218 @@ function useHoldToTalk(speechLang, onFinish) {
   return { phase, error, supported, startHold, stopHold };
 }
 
+// ---- Gemini transcription: the app records audio itself and has Gemini write down what was actually said ----
+
+async function blobToWav16k(blob) {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  const Offline = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const ctx = new Ctx();
+  let decoded;
+  try {
+    decoded = await ctx.decodeAudioData(await blob.arrayBuffer());
+  } finally {
+    try { ctx.close(); } catch (e) { /* noop */ }
+  }
+  const off = new Offline(1, Math.max(1, Math.ceil(decoded.duration * 16000)), 16000);
+  const src = off.createBufferSource();
+  src.buffer = decoded;
+  src.connect(off.destination);
+  src.start();
+  const pcm = (await off.startRendering()).getChannelData(0);
+  const buf = new ArrayBuffer(44 + pcm.length * 2);
+  const v = new DataView(buf);
+  const str = (o, t) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
+  str(0, "RIFF"); v.setUint32(4, 36 + pcm.length * 2, true); str(8, "WAVE"); str(12, "fmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, 16000, true); v.setUint32(28, 32000, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  str(36, "data"); v.setUint32(40, pcm.length * 2, true);
+  for (let i = 0; i < pcm.length; i++) {
+    const x = Math.max(-1, Math.min(1, pcm[i]));
+    v.setInt16(44 + i * 2, x < 0 ? x * 0x8000 : x * 0x7fff, true);
+  }
+  return { blob: new Blob([buf], { type: "audio/wav" }), seconds: decoded.duration };
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(",")[1] || "");
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+}
+
+async function transcribeWithGemini(apiKey, base64, mime, langLabel) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+    body: JSON.stringify({
+      systemInstruction: {
+        parts: [{
+          text: `You are a strict, literal speech-to-text engine inside a language-learning app. The speaker is a learner of ${langLabel} and may pronounce words imperfectly. Write down exactly the words that were actually spoken, in ${langLabel}. Do not correct grammar, do not complete missing words, do not make the sentence more logical or more common, do not translate, and do not add punctuation beyond what is needed. If a word is unclear, write the closest-sounding word that was really said. If there is no intelligible speech, return an empty string. Return only JSON: {"text": "..."}.`,
+        }],
+      },
+      contents: [{ role: "user", parts: [{ text: `Transcribe this short recording (${langLabel}).` }, { inline_data: { mime_type: mime, data: base64 } }] }],
+      generationConfig: { temperature: 0, responseMimeType: "application/json" },
+    }),
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    const e = new Error(`שגיאת שרת (${res.status}): ${errText.slice(0, 160)}`);
+    e.status = res.status;
+    throw e;
+  }
+  const data = await res.json();
+  const raw = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
+  try {
+    return String(JSON.parse(raw).text || "").trim();
+  } catch (e) {
+    return raw.replace(/[{}"]|text:/g, "").trim();
+  }
+}
+
+const geminiMicSupported = () =>
+  typeof navigator !== "undefined" && !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) && typeof window !== "undefined" && !!window.MediaRecorder;
+
+// Hold-to-talk that records audio and sends it to Gemini. Same interface as useHoldToTalk, plus the "processing" phase.
+function useGeminiHoldToTalk(apiKey, langLabel, onFinish, enabled) {
+  const [phase, setPhase] = useState("idle"); // idle | starting | listening | processing
+  const [error, setError] = useState(null);
+  const heldRef = useRef(false);
+  const streamRef = useRef(null);
+  const streamPromiseRef = useRef(null);
+  const recorderRef = useRef(null);
+  const chunksRef = useRef([]);
+  const stopScheduledRef = useRef(false);
+  const aliveRef = useRef(true);
+  const finishRef = useRef(onFinish);
+  finishRef.current = onFinish;
+
+  function getStream() {
+    if (streamRef.current) return Promise.resolve(streamRef.current);
+    if (!streamPromiseRef.current) {
+      streamPromiseRef.current = navigator.mediaDevices
+        .getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } })
+        .then((st) => {
+          if (!aliveRef.current) { st.getTracks().forEach((t) => t.stop()); return st; }
+          streamRef.current = st;
+          return st;
+        })
+        .catch((e) => { streamPromiseRef.current = null; throw e; });
+    }
+    return streamPromiseRef.current;
+  }
+
+  useEffect(() => {
+    aliveRef.current = true;
+    // open the microphone ahead of the first press so the first words are not clipped
+    if (enabled) getStream().catch(() => {});
+    return () => {
+      aliveRef.current = false;
+      heldRef.current = false;
+      try { recorderRef.current && recorderRef.current.state !== "inactive" && recorderRef.current.stop(); } catch (e) { /* noop */ }
+      if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function process(blob) {
+    if (!aliveRef.current) return;
+    setPhase("processing");
+    try {
+      let mime = "audio/wav";
+      let payload;
+      let seconds = 1;
+      try {
+        const wav = await blobToWav16k(blob);
+        payload = wav.blob;
+        seconds = wav.seconds;
+      } catch (e) {
+        payload = blob; // could not convert: send the original recording
+        mime = (blob.type || "audio/webm").split(";")[0];
+      }
+      if (seconds < 0.25) throw new Error("ההקלטה קצרה מדי - החזיקו את הכפתור לאורך כל המשפט.");
+      const text = await transcribeWithGemini(apiKey, await blobToBase64(payload), mime, langLabel);
+      if (!aliveRef.current) return;
+      setPhase("idle");
+      if (!text) setError("לא זוהה דיבור. נסו להקליט שוב, או להקליד.");
+      else if (finishRef.current) finishRef.current(text);
+    } catch (e) {
+      if (!aliveRef.current) return;
+      setPhase("idle");
+      setError(
+        e.status === 429
+          ? "הגעתם למכסת הבקשות של Gemini כרגע. נסו שוב בעוד רגע, או הקלידו."
+          : e.message || "שגיאה בתמלול. נסו שוב, או הקלידו."
+      );
+    }
+  }
+
+  async function startHold() {
+    if (heldRef.current) return;
+    heldRef.current = true;
+    stopScheduledRef.current = false;
+    setError(null);
+    setPhase("starting");
+    let stream;
+    try {
+      stream = await getStream();
+    } catch (e) {
+      heldRef.current = false;
+      setPhase("idle");
+      setError("הגישה למיקרופון נחסמה. אשרו הרשאת מיקרופון בדפדפן ונסו שוב.");
+      return;
+    }
+    if (!heldRef.current || !aliveRef.current) { setPhase("idle"); return; } // released while the microphone was opening
+    chunksRef.current = [];
+    let rec;
+    try {
+      const types = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
+      const mt = types.find((t) => window.MediaRecorder.isTypeSupported && window.MediaRecorder.isTypeSupported(t));
+      rec = mt ? new MediaRecorder(stream, { mimeType: mt }) : new MediaRecorder(stream);
+    } catch (e) {
+      heldRef.current = false;
+      setPhase("idle");
+      setError("לא הצלחנו להתחיל הקלטה במכשיר הזה. אפשר להקליד.");
+      return;
+    }
+    recorderRef.current = rec;
+    rec.ondataavailable = (ev) => { if (ev.data && ev.data.size) chunksRef.current.push(ev.data); };
+    rec.onstart = () => setPhase("listening");
+    rec.onstop = () => {
+      const blob = new Blob(chunksRef.current, { type: rec.mimeType || "audio/webm" });
+      chunksRef.current = [];
+      process(blob);
+    };
+    rec.start();
+  }
+
+  function stopHold() {
+    if (!heldRef.current || stopScheduledRef.current) return;
+    stopScheduledRef.current = true;
+    setTimeout(() => {
+      stopScheduledRef.current = false;
+      heldRef.current = false;
+      const rec = recorderRef.current;
+      if (rec && rec.state !== "inactive") {
+        try { rec.stop(); } catch (e) { setPhase("idle"); }
+      } else {
+        setPhase("idle");
+      }
+    }, 500); // grace period so the last word isn't clipped
+  }
+
+  return { phase, error, supported: enabled, startHold, stopHold };
+}
+
 function HoldMic({ mic, label }) {
   const active = mic.phase === "listening" || mic.phase === "starting";
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
       <button
         className={"ela-micbtn" + (active ? " listening" : "")}
+        disabled={mic.phase === "processing"}
         onPointerDown={(e) => { e.preventDefault(); mic.startHold(); }}
         onPointerUp={mic.stopHold}
         onPointerLeave={mic.stopHold}
@@ -2121,7 +2327,7 @@ function HoldMic({ mic, label }) {
         <Mic size={26} />
       </button>
       <span style={{ fontSize: 12.5, color: "var(--muted)" }}>
-        {mic.phase === "starting" ? "מתחברים למיקרופון..." : mic.phase === "listening" ? "מקליט... שחררו כשסיימתם" : label}
+        {mic.phase === "starting" ? "מתחברים למיקרופון..." : mic.phase === "listening" ? "מקליט... שחררו כשסיימתם" : mic.phase === "processing" ? "מתמללים..." : label}
       </span>
       {mic.error && <div className="ela-errbox">{mic.error}</div>}
     </div>
@@ -2139,10 +2345,15 @@ function ChunkStep({ step, chunk, lang, level, apiKey, langInfo, onResult }) {
   const [fb, setFb] = useState(null);
   const [err, setErr] = useState(null);
 
-  const mic = useHoldToTalk(langInfo.speechLang, (t) => {
+  const onHeard = (t) => {
     setHeard(t);
     if (step.type === "use") setTyped(t);
-  });
+  };
+  // preferred: record audio and let Gemini transcribe it literally; otherwise the browser's own recognizer
+  const useGemini = !!apiKey && geminiMicSupported();
+  const browserMic = useHoldToTalk(langInfo.speechLang, onHeard);
+  const geminiMic = useGeminiHoldToTalk(apiKey, langInfo.label, onHeard, useGemini && step.type !== "recognize");
+  const mic = useGemini ? geminiMic : browserMic;
 
   useEffect(() => {
     if (step.type === "recognize") speak(chunk.text, langInfo.speechLang);
