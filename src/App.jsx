@@ -1543,8 +1543,13 @@ function Settings({ state, onSave, onRestore, onBackedUp }) {
   async function downloadBackup() {
     const text = buildBackup(state);
     try {
-      const file = new File([text], backupFileName(), { type: "application/json" });
-      if (navigator.canShare && navigator.canShare({ files: [file] }) && /Android|iPhone|iPad/i.test(navigator.userAgent)) {
+      // many phones refuse to share a .json file through the share sheet, so also try the same content as a plain-text file
+      const candidates = [
+        new File([text], backupFileName(), { type: "application/json" }),
+        new File([text], backupFileName().replace(/\.json$/, ".txt"), { type: "text/plain" }),
+      ];
+      const file = navigator.canShare && candidates.find((f) => navigator.canShare({ files: [f] }));
+      if (file && /Android|iPhone|iPad/i.test(navigator.userAgent)) {
         await navigator.share({ files: [file], title: "SpeakUp backup" });
         backedUp();
         setBkMsg({ ok: true, msg: "הגיבוי נשלח לשמירה. מומלץ לבחור Google Drive או 'שמירה בקבצים'." });
@@ -1653,7 +1658,7 @@ function Settings({ state, onSave, onRestore, onBackedUp }) {
         )}
         {fileName && <button className="ela-btn secondary" onClick={disconnectFile}>ניתוק גיבוי אוטומטי</button>}
       </div>
-      <input ref={fileInputRef} type="file" accept=".json,application/json" style={{ display: "none" }} onChange={onPickRestore} />
+      <input ref={fileInputRef} type="file" accept=".json,.txt,application/json,text/plain" style={{ display: "none" }} onChange={onPickRestore} />
       {fileName && (
         <div className="ela-note">גיבוי אוטומטי פעיל לקובץ <b>{fileName}</b> - מתעדכן בסיום כל תרגול (הדפדפן עשוי לבקש אישור פעם בכל הפעלה).</div>
       )}
