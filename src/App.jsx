@@ -541,6 +541,7 @@ async function saveState(state) {
 /* ============================== BACKUP ============================== */
 
 const BACKUP_META_KEY = "app-backup-meta";
+const PREMERGE_KEY = "app-state-premerge";
 
 function readBackupMeta() {
   try {
@@ -574,6 +575,110 @@ function parseBackup(text) {
   const obj = JSON.parse(text);
   if (!obj || obj.app !== "speakup" || !obj.state || !obj.state.langData) throw new Error("זה לא קובץ גיבוי של SpeakUp");
   return migrateState(obj.state);
+}
+
+// ---- merging a backup from another device into this device's data ----
+
+function mergeBackupState(local, incoming) {
+  const report = { chunksAdded: 0, chunksUpdated: 0, chunksRemoved: 0, wordsAdded: 0, wordsUpdated: 0, otherChanges: 0 };
+  const normText = (t) => normTokens(t).join(" ");
+  const recency = (c) => String(c.lastReviewed || c.added || "");
+  const pickChunk = (a, b) => {
+    const ra = recency(a);
+    const rb = recency(b);
+    if (ra !== rb) return ra > rb ? a : b;
+    if ((a.reviews || 0) !== (b.reviews || 0)) return (a.reviews || 0) > (b.reviews || 0) ? a : b;
+    return (a.box || 0) >= (b.box || 0) ? a : b;
+  };
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+  const langs = {};
+  const keys = new Set([...Object.keys(local.langData || {}), ...Object.keys(incoming.langData || {})]);
+  keys.forEach((lang) => {
+    const L = { ...defaultLangData(), ...((local.langData || {})[lang] || {}) };
+    const I = (incoming.langData || {})[lang] ? { ...defaultLangData(), ...incoming.langData[lang] } : null;
+    if (!I) { langs[lang] = L; return; }
+
+    // deleted chunks stay deleted on both devices
+    const blocked = Array.from(new Set([...(L.chunkBlocked || []), ...(I.chunkBlocked || [])]));
+    const blockedKeys = new Set(blocked.map(normText));
+
+    // chunks: one per distinct text
+    const byText = {};
+    Object.values(L.chunks || {}).forEach((c) => { byText[normText(c.text)] = { chunk: c, fromLocal: true }; });
+    Object.values(I.chunks || {}).forEach((c) => {
+      const k = normText(c.text);
+      const cur = byText[k];
+      if (!cur) { byText[k] = { chunk: c, fromLocal: false }; return; }
+      const chosen = pickChunk(cur.chunk, c);
+      const merged = { ...chosen, stage: Math.max(cur.chunk.stage || 0, c.stage || 0) };
+      cur.chunk = merged;
+    });
+    const chunks = {};
+    Object.entries(byText).forEach(([k, v]) => {
+      if (blockedKeys.has(k)) { if (v.fromLocal) report.chunksRemoved++; return; }
+      chunks[v.chunk.id] = v.chunk;
+    });
+    // counts (after dedupe): added = texts only in incoming, updated = texts in both whose stored version changed
+    const localByText = {};
+    Object.values(L.chunks || {}).forEach((c) => { localByText[normText(c.text)] = c; });
+    Object.values(chunks).forEach((c) => {
+      const lc = localByText[normText(c.text)];
+      if (!lc) report.chunksAdded++;
+      else if (!same(lc, c)) report.chunksUpdated++;
+    });
+
+    // vocabulary progress (English bank): keep the more recently updated / further progressed entry
+    const words = { ...(L.words || {}) };
+    Object.entries(I.words || {}).forEach(([id, w]) => {
+      const cur = words[id];
+      if (!cur) { words[id] = w; report.wordsAdded++; return; }
+      const uc = String(cur.updated || "");
+      const ui = String(w.updated || "");
+      const takeIncoming = uc !== ui ? ui > uc : (w.box || 0) > (cur.box || 0);
+      if (takeIncoming && !same(cur, w)) { words[id] = w; report.wordsUpdated++; }
+    });
+
+    // mistake tags: keep the larger count of each tag, so shared history is not doubled
+    const count = (arr) => arr.reduce((m, t) => ((m[t] = (m[t] || 0) + 1), m), {});
+    const cl = count((L.speakingMemory || {}).mistakeTags || []);
+    const ci = count((I.speakingMemory || {}).mistakeTags || []);
+    const tags = [];
+    Object.keys({ ...cl, ...ci }).forEach((t) => { for (let n = 0; n < Math.max(cl[t] || 0, ci[t] || 0); n++) tags.push(t); });
+
+    const levelStats = {};
+    ["beginner", "intermediate", "advanced"].forEach((lv) => {
+      const a = (L.levelStats || {})[lv] || { good: 0, bad: 0 };
+      const b = (I.levelStats || {})[lv] || { good: 0, bad: 0 };
+      levelStats[lv] = { good: Math.max(a.good, b.good), bad: Math.max(a.bad, b.bad) };
+    });
+
+    langs[lang] = {
+      ...L,
+      levelStats,
+      words,
+      chunks,
+      chunkBlocked: blocked.slice(-300),
+      convosDone: { ...(I.convosDone || {}), ...(L.convosDone || {}) },
+      aiSeenWords: Array.from(new Set([...(L.aiSeenWords || []), ...(I.aiSeenWords || [])])).slice(-60),
+      speakingMemory: { ...(L.speakingMemory || {}), mistakeTags: tags.slice(-30) },
+    };
+  });
+
+  const ls = local.stats || {};
+  const is = incoming.stats || {};
+  const ld = ls.lastActiveDate || "";
+  const id = is.lastActiveDate || "";
+  const stats = {
+    ...ls,
+    lastActiveDate: ld >= id ? ls.lastActiveDate || null : is.lastActiveDate || null,
+    streak: ld === id ? Math.max(ls.streak || 0, is.streak || 0) : ld > id ? ls.streak || 0 : is.streak || 0,
+    xp: Math.max(ls.xp || 0, is.xp || 0),
+    sessionsCompleted: Math.max(ls.sessionsCompleted || 0, is.sessionsCompleted || 0),
+  };
+  const merged = { ...local, onboarded: !!(local.onboarded || incoming.onboarded), stats, langData: langs };
+  report.otherChanges = same(stats, ls) ? 0 : 1;
+  return { state: merged, report };
 }
 
 function downloadFile(name, text, mime = "application/json") {
@@ -1520,7 +1625,7 @@ function ConvoPlayer({ dialogue, speechLang, onBack, onComplete, done }) {
 
 /* ============================== SETTINGS VIEW ============================== */
 
-function Settings({ state, onSave, onRestore, onBackedUp }) {
+function Settings({ state, onSave, onRestore, onMerge, onBackedUp }) {
   const [value, setValue] = useState(state.settings.apiKey || "");
   const [show, setShow] = useState(false);
   const [status, setStatus] = useState(null); // { ok: bool, msg }
@@ -1529,6 +1634,10 @@ function Settings({ state, onSave, onRestore, onBackedUp }) {
   const [fileName, setFileName] = useState(null);
   const [days, setDays] = useState(daysSinceBackup());
   const fileInputRef = useRef(null);
+  const mergeInputRef = useRef(null);
+  const [canUndo, setCanUndo] = useState(() => {
+    try { return !!localStorage.getItem(PREMERGE_KEY); } catch (e) { return false; }
+  });
 
   useEffect(() => {
     connectedBackupName().then(setFileName);
@@ -1594,6 +1703,46 @@ function Settings({ state, onSave, onRestore, onBackedUp }) {
     }
   }
 
+  async function onPickMerge(e) {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!f) return;
+    try {
+      const incoming = parseBackup(await f.text());
+      const { state: merged, report: r } = mergeBackupState(state, incoming);
+      const lines = [];
+      if (r.chunksAdded) lines.push(`צ'אנקים חדשים: ${r.chunksAdded}`);
+      if (r.chunksUpdated) lines.push(`צ'אנקים שהתקדמו: ${r.chunksUpdated}`);
+      if (r.chunksRemoved) lines.push(`צ'אנקים שיימחקו (נמחקו במכשיר השני): ${r.chunksRemoved}`);
+      if (r.wordsAdded || r.wordsUpdated) lines.push(`מילים: ${r.wordsAdded} חדשות, ${r.wordsUpdated} עודכנו`);
+      if (r.otherChanges) lines.push("עדכון רצף ימים ונקודות ניסיון");
+      if (!lines.length) {
+        setBkMsg({ ok: true, msg: "אין מה למזג - הנתונים כאן כבר מעודכנים לפי הקובץ." });
+        return;
+      }
+      if (!window.confirm(`המיזוג יצרף לנתונים שבמכשיר הזה:\n\n${lines.join("\n")}\n\nאפשר לבטל את המיזוג האחרון מההגדרות. להמשיך?`)) return;
+      onMerge(merged);
+      setCanUndo(true);
+      setBkMsg({ ok: true, msg: `המיזוג הושלם. ${lines.join(" · ")}` });
+    } catch (err) {
+      setBkMsg({ ok: false, msg: err.message || "קובץ הגיבוי לא תקין." });
+    }
+  }
+
+  function undoMerge() {
+    try {
+      const prev = JSON.parse(localStorage.getItem(PREMERGE_KEY) || "null");
+      if (!prev || !prev.state) throw new Error("none");
+      if (!window.confirm("לבטל את המיזוג האחרון ולחזור למצב שלפניו?")) return;
+      onRestore(migrateState(prev.state));
+      localStorage.removeItem(PREMERGE_KEY);
+      setCanUndo(false);
+      setBkMsg({ ok: true, msg: "המיזוג בוטל, והנתונים חזרו למצב שלפניו." });
+    } catch (err) {
+      setBkMsg({ ok: false, msg: "אין מיזוג לביטול." });
+    }
+  }
+
   async function testKey(key) {
     setChecking(true);
     setStatus(null);
@@ -1653,12 +1802,16 @@ function Settings({ state, onSave, onRestore, onBackedUp }) {
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
         <button className="ela-btn" onClick={downloadBackup}>גיבוי עכשיו</button>
         <button className="ela-btn secondary" onClick={() => fileInputRef.current && fileInputRef.current.click()}>שחזור מקובץ</button>
+        <button className="ela-btn secondary" onClick={() => mergeInputRef.current && mergeInputRef.current.click()}>מיזוג מקובץ (ממכשיר אחר)</button>
+        {canUndo && <button className="ela-btn secondary" onClick={undoMerge}>ביטול המיזוג האחרון</button>}
         {canAutoFileBackup() && !fileName && (
           <button className="ela-btn secondary" onClick={connectFile}>גיבוי אוטומטי לקובץ</button>
         )}
         {fileName && <button className="ela-btn secondary" onClick={disconnectFile}>ניתוק גיבוי אוטומטי</button>}
       </div>
       <input ref={fileInputRef} type="file" accept=".json,.txt,application/json,text/plain" style={{ display: "none" }} onChange={onPickRestore} />
+      <input ref={mergeInputRef} type="file" accept=".json,.txt,application/json,text/plain" style={{ display: "none" }} onChange={onPickMerge} />
+      <p className="ela-note">"מיזוג" מצרף את ההתקדמות מגיבוי של מכשיר אחר (למשל מהמחשב לטלפון) בלי למחוק את מה שיש כאן. "שחזור" מחליף הכול בנתוני הקובץ.</p>
       {fileName && (
         <div className="ela-note">גיבוי אוטומטי פעיל לקובץ <b>{fileName}</b> - מתעדכן בסיום כל תרגול (הדפדפן עשוי לבקש אישור פעם בכל הפעלה).</div>
       )}
@@ -3013,7 +3166,7 @@ export default function App() {
       results.forEach(({ id, correct }) => {
         const prev = words[id] || { box: 0, due: todayStr() };
         const box = correct ? Math.min(prev.box + 1, BOX_INTERVALS.length - 1) : 1;
-        words[id] = { box, due: addDays(todayStr(), correct ? BOX_INTERVALS[box] : 0) };
+        words[id] = { box, due: addDays(todayStr(), correct ? BOX_INTERVALS[box] : 0), updated: todayStr() };
       });
     }
     const correctCount = results.filter((r) => r.correct).length;
@@ -3190,6 +3343,11 @@ export default function App() {
               state={state}
               onSave={saveApiKey}
               onRestore={(restored) => persist({ ...restored, onboarded: true, settings: { ...restored.settings, apiKey: state.settings.apiKey } })}
+              onMerge={(merged) => {
+                try { localStorage.setItem(PREMERGE_KEY, JSON.stringify({ at: Date.now(), state })); } catch (e) { /* noop */ }
+                persist(merged);
+                writeBackupFile(merged).then((r) => { if (r === "ok") setBackupTick((t) => t + 1); });
+              }}
               onBackedUp={() => setBackupTick((t) => t + 1)}
             />
           )}
