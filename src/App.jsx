@@ -3225,6 +3225,7 @@ export default function App() {
   }, []);
 
   // evaluate the other device's backup file against local state; returns a message for manual checks
+  const foundPeerRef = useRef(null);
   const evaluatePeer = useCallback(async (st, ask) => {
     const res = await peerCheck(ask);
     if (res.status === "needs-permission") {
@@ -3247,7 +3248,9 @@ export default function App() {
       setPeer(null);
       return "אין מה למזג - הנתונים כאן כבר מעודכנים.";
     }
-    setPeer({ kind: "new", name: res.name, exportedAt: res.exportedAt, merged, report });
+    const found = { kind: "new", name: res.name, exportedAt: res.exportedAt, merged, report };
+    foundPeerRef.current = found;
+    setPeer(found);
     setPeerDismissed(false);
     return "נמצא גיבוי חדש - ראו את הבאנר בדף הבית.";
   }, []);
@@ -3262,15 +3265,22 @@ export default function App() {
   async function onPeerAction() {
     if (!peer) return;
     if (peer.kind === "ask") {
+      // the tap that grants file access leads straight to the merge question - no second banner
+      foundPeerRef.current = null;
       await evaluatePeer(state, true);
+      if (foundPeerRef.current) await mergePeer(foundPeerRef.current);
       return;
     }
-    const lines = describeMergeReport(peer.report);
-    if (!window.confirm(`גיבוי מהמכשיר השני (${fmtWhen(peer.exportedAt)}) יצרף לכאן:\n\n${lines.join("\n")}\n\nאפשר לבטל מההגדרות. למזג?`)) return;
+    await mergePeer(peer);
+  }
+
+  async function mergePeer(p) {
+    const lines = describeMergeReport(p.report);
+    if (!window.confirm(`גיבוי מהמכשיר השני (${fmtWhen(p.exportedAt)}) יצרף לכאן:\n\n${lines.join("\n")}\n\nאפשר לבטל מההגדרות. למזג?`)) return;
     try { localStorage.setItem(PREMERGE_KEY, JSON.stringify({ at: Date.now(), state })); } catch (e) { /* noop */ }
-    persist(peer.merged);
-    if (peer.exportedAt) writePeerMeta({ lastMergedAt: peer.exportedAt });
-    writeBackupFile(peer.merged).then((r) => { if (r === "ok") setBackupTick((t) => t + 1); });
+    persist(p.merged);
+    if (p.exportedAt) writePeerMeta({ lastMergedAt: p.exportedAt });
+    writeBackupFile(p.merged).then((r) => { if (r === "ok") setBackupTick((t) => t + 1); });
     setPeer(null);
   }
 
