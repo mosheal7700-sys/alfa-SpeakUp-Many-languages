@@ -566,9 +566,93 @@ function daysSinceBackup() {
 }
 
 // the API key is deliberately left out of backups, so a shared backup file never leaks it
+function getDeviceId() {
+  try {
+    let id = localStorage.getItem("app-device-id");
+    if (!id) {
+      id = "d" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+      localStorage.setItem("app-device-id", id);
+    }
+    return id;
+  } catch (e) {
+    return "unknown";
+  }
+}
+
 function buildBackup(state) {
   const safe = { ...state, settings: { ...state.settings, apiKey: "" } };
-  return JSON.stringify({ app: "speakup", version: 1, exportedAt: new Date().toISOString(), state: safe }, null, 1);
+  return JSON.stringify({ app: "speakup", version: 1, exportedAt: new Date().toISOString(), deviceId: getDeviceId(), state: safe }, null, 1);
+}
+
+function describeMergeReport(r) {
+  const lines = [];
+  if (r.chunksAdded) lines.push(`צ'אנקים חדשים: ${r.chunksAdded}`);
+  if (r.chunksUpdated) lines.push(`צ'אנקים שהתקדמו: ${r.chunksUpdated}`);
+  if (r.chunksRemoved) lines.push(`צ'אנקים שיימחקו (נמחקו במכשיר השני): ${r.chunksRemoved}`);
+  if (r.wordsAdded || r.wordsUpdated) lines.push(`מילים: ${r.wordsAdded} חדשות, ${r.wordsUpdated} עודכנו`);
+  if (r.otherChanges) lines.push("עדכון רצף ימים ונקודות ניסיון");
+  return lines;
+}
+
+function fmtWhen(iso) {
+  try {
+    return new Date(iso).toLocaleString("he-IL", { day: "numeric", month: "numeric", hour: "2-digit", minute: "2-digit" });
+  } catch (e) {
+    return "";
+  }
+}
+
+// --- the backup file of the OTHER device, connected once; checked on every app start ---
+const PEER_META_KEY = "app-peer-meta";
+const canPeerFile = () => typeof window !== "undefined" && !!window.showOpenFilePicker && !!window.indexedDB;
+
+function readPeerMeta() {
+  try { return JSON.parse(localStorage.getItem(PEER_META_KEY) || "null") || {}; } catch (e) { return {}; }
+}
+function writePeerMeta(patch) {
+  try { localStorage.setItem(PEER_META_KEY, JSON.stringify({ ...readPeerMeta(), ...patch })); } catch (e) { /* noop */ }
+}
+
+async function connectPeerFile() {
+  const [handle] = await window.showOpenFilePicker({
+    multiple: false,
+    types: [{ description: "SpeakUp backup", accept: { "application/json": [".json"], "text/plain": [".txt"] } }],
+  });
+  await idbSet("peerHandle", handle);
+  return handle.name;
+}
+async function disconnectPeerFile() {
+  await idbSet("peerHandle", undefined);
+  writePeerMeta({ lastMergedAt: null });
+}
+async function peerFileName() {
+  try {
+    if (!canPeerFile()) return null;
+    const h = await idbGet("peerHandle");
+    return h ? h.name : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// status: unsupported | none | needs-permission | denied | invalid | error | ok
+async function peerCheck(ask) {
+  try {
+    if (!canPeerFile()) return { status: "unsupported" };
+    const h = await idbGet("peerHandle");
+    if (!h) return { status: "none" };
+    let perm = await h.queryPermission({ mode: "read" });
+    if (perm !== "granted") {
+      if (!ask) return { status: "needs-permission", name: h.name };
+      perm = await h.requestPermission({ mode: "read" });
+      if (perm !== "granted") return { status: "denied", name: h.name };
+    }
+    const obj = JSON.parse(await (await h.getFile()).text());
+    if (!obj || obj.app !== "speakup" || !obj.state || !obj.state.langData) return { status: "invalid", name: h.name };
+    return { status: "ok", name: h.name, exportedAt: obj.exportedAt || "", deviceId: obj.deviceId || null, incoming: migrateState(obj.state) };
+  } catch (e) {
+    return { status: "error" };
+  }
 }
 
 function parseBackup(text) {
@@ -1210,7 +1294,7 @@ function GlobalStyle() {
 
 /* ============================== HOME VIEW ============================== */
 
-function Home({ state, langData, currentLang, setLevel, setLanguage, dueCount, newCount, chunkDue, chunkTotal, backupStale, onGo }) {
+function Home({ state, langData, currentLang, setLevel, setLanguage, dueCount, newCount, chunkDue, chunkTotal, backupStale, onGo, peerBanner, onPeerAction, onPeerDismiss }) {
   const doneToday = state.stats.lastActiveDate === todayStr();
   const aiOn = !!state.settings.apiKey;
   const langInfo = languageInfo(currentLang);
@@ -1243,7 +1327,17 @@ function Home({ state, langData, currentLang, setLevel, setLanguage, dueCount, n
         </div>
       )}
 
-      {backupStale && (
+      {peerBanner && (
+        <div style={{ background: "var(--sage-light)", color: "var(--sage)", borderRadius: 12, padding: "10px 12px", margin: "12px 0", display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", fontSize: 14 }}>
+          <span style={{ flex: 1, minWidth: 180 }}>
+            {peerBanner.kind === "ask" ? "לבדיקת גיבוי חדש מהמכשיר השני נדרש אישור קצר מהדפדפן." : "יש גיבוי חדש מהמכשיר השני - למזג?"}
+          </span>
+          <button className="ela-btn" style={{ padding: "6px 14px" }} onClick={onPeerAction}>{peerBanner.kind === "ask" ? "בדיקה" : "מיזוג"}</button>
+          <button className="ela-btn secondary" style={{ padding: "6px 14px" }} onClick={onPeerDismiss}>לא עכשיו</button>
+        </div>
+      )}
+
+      {backupStale && !peerBanner && (
         <div className="ela-note" style={{ background: "var(--gold-light)", color: "#8A6412", borderRadius: 12, padding: "10px 12px", margin: "12px 0", cursor: "pointer" }} onClick={() => onGo("settings")}>
           כדאי לגבות את ההתקדמות שלך - לחצו כאן להגדרות הגיבוי.
         </div>
@@ -1625,7 +1719,7 @@ function ConvoPlayer({ dialogue, speechLang, onBack, onComplete, done }) {
 
 /* ============================== SETTINGS VIEW ============================== */
 
-function Settings({ state, onSave, onRestore, onMerge, onBackedUp }) {
+function Settings({ state, onSave, onRestore, onMerge, onBackedUp, onPeerCheck }) {
   const [value, setValue] = useState(state.settings.apiKey || "");
   const [show, setShow] = useState(false);
   const [status, setStatus] = useState(null); // { ok: bool, msg }
@@ -1635,11 +1729,14 @@ function Settings({ state, onSave, onRestore, onMerge, onBackedUp }) {
   const [days, setDays] = useState(daysSinceBackup());
   const fileInputRef = useRef(null);
   const mergeInputRef = useRef(null);
+  const [peerName, setPeerName] = useState(null);
+  const [peerBusy, setPeerBusy] = useState(false);
   const [canUndo, setCanUndo] = useState(() => {
     try { return !!localStorage.getItem(PREMERGE_KEY); } catch (e) { return false; }
   });
 
   useEffect(() => {
+    peerFileName().then(setPeerName);
     connectedBackupName().then(setFileName);
   }, []);
 
@@ -1710,12 +1807,7 @@ function Settings({ state, onSave, onRestore, onMerge, onBackedUp }) {
     try {
       const incoming = parseBackup(await f.text());
       const { state: merged, report: r } = mergeBackupState(state, incoming);
-      const lines = [];
-      if (r.chunksAdded) lines.push(`צ'אנקים חדשים: ${r.chunksAdded}`);
-      if (r.chunksUpdated) lines.push(`צ'אנקים שהתקדמו: ${r.chunksUpdated}`);
-      if (r.chunksRemoved) lines.push(`צ'אנקים שיימחקו (נמחקו במכשיר השני): ${r.chunksRemoved}`);
-      if (r.wordsAdded || r.wordsUpdated) lines.push(`מילים: ${r.wordsAdded} חדשות, ${r.wordsUpdated} עודכנו`);
-      if (r.otherChanges) lines.push("עדכון רצף ימים ונקודות ניסיון");
+      const lines = describeMergeReport(r);
       if (!lines.length) {
         setBkMsg({ ok: true, msg: "אין מה למזג - הנתונים כאן כבר מעודכנים לפי הקובץ." });
         return;
@@ -1726,6 +1818,33 @@ function Settings({ state, onSave, onRestore, onMerge, onBackedUp }) {
       setBkMsg({ ok: true, msg: `המיזוג הושלם. ${lines.join(" · ")}` });
     } catch (err) {
       setBkMsg({ ok: false, msg: err.message || "קובץ הגיבוי לא תקין." });
+    }
+  }
+
+  async function connectPeer() {
+    try {
+      const name = await connectPeerFile();
+      setPeerName(name);
+      setBkMsg({ ok: true, msg: `חובר הקובץ ${name}. בכל פתיחה של האפליקציה נבדוק אם יש בו גיבוי חדש, ונציע מיזוג.` });
+    } catch (e) {
+      if (!e || e.name !== "AbortError") setBkMsg({ ok: false, msg: "לא הצלחנו לחבר את הקובץ." });
+    }
+  }
+
+  async function disconnectPeer() {
+    await disconnectPeerFile();
+    setPeerName(null);
+    setBkMsg({ ok: true, msg: "החיבור לקובץ של המכשיר השני בוטל." });
+  }
+
+  async function checkPeerNow() {
+    setPeerBusy(true);
+    try {
+      const msg = await onPeerCheck();
+      if (msg) setBkMsg({ ok: true, msg });
+      setCanUndo(!!localStorage.getItem(PREMERGE_KEY));
+    } finally {
+      setPeerBusy(false);
     }
   }
 
@@ -1811,6 +1930,23 @@ function Settings({ state, onSave, onRestore, onMerge, onBackedUp }) {
       </div>
       <input ref={fileInputRef} type="file" accept=".json,.txt,application/json,text/plain" style={{ display: "none" }} onChange={onPickRestore} />
       <input ref={mergeInputRef} type="file" accept=".json,.txt,application/json,text/plain" style={{ display: "none" }} onChange={onPickMerge} />
+      {canPeerFile() && (
+        <div style={{ marginTop: 16 }}>
+          <p className="ela-sub" style={{ marginBottom: 8, fontWeight: 600 }}>בדיקה אוטומטית של גיבוי מהמכשיר השני</p>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            {!peerName ? (
+              <button className="ela-btn secondary" onClick={connectPeer}>חיבור קובץ הגיבוי של המכשיר השני</button>
+            ) : (
+              <>
+                <button className="ela-btn secondary" disabled={peerBusy} onClick={checkPeerNow}>{peerBusy ? "בודק..." : "בדיקה עכשיו"}</button>
+                <button className="ela-btn secondary" onClick={disconnectPeer}>ניתוק הקובץ</button>
+              </>
+            )}
+          </div>
+          {peerName && <div className="ela-note">מחובר: <b>{peerName}</b>. בכל פתיחה האפליקציה בודקת אם הקובץ חדש יותר ממה שמוזג, ומציעה מיזוג בדף הבית.</div>}
+          {!peerName && <div className="ela-note">מחברים פעם אחת את קובץ הגיבוי של המכשיר השני (מהתיקייה ב-Drive).</div>}
+        </div>
+      )}
       <p className="ela-note">"מיזוג" מצרף את ההתקדמות מגיבוי של מכשיר אחר (למשל מהמחשב לטלפון) בלי למחוק את מה שיש כאן. "שחזור" מחליף הכול בנתוני הקובץ.</p>
       {fileName && (
         <div className="ela-note">גיבוי אוטומטי פעיל לקובץ <b>{fileName}</b> - מתעדכן בסיום כל תרגול (הדפדפן עשוי לבקש אישור פעם בכל הפעלה).</div>
@@ -3067,6 +3203,8 @@ export default function App() {
   const [lastResults, setLastResults] = useState([]);
   const [levelSuggestion, setLevelSuggestion] = useState(null);
   const [backupTick, setBackupTick] = useState(0);
+  const [peer, setPeer] = useState(null); // {kind:"new"|"ask", name, exportedAt, merged, report}
+  const [peerDismissed, setPeerDismissed] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -3085,6 +3223,56 @@ export default function App() {
   useEffect(() => {
     try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch (e) { /* noop */ }
   }, []);
+
+  // evaluate the other device's backup file against local state; returns a message for manual checks
+  const evaluatePeer = useCallback(async (st, ask) => {
+    const res = await peerCheck(ask);
+    if (res.status === "needs-permission") {
+      setPeer({ kind: "ask", name: res.name });
+      return "הדפדפן דורש אישור לקריאת הקובץ - לחצו על הבאנר בדף הבית.";
+    }
+    if (res.status === "denied") return "לא ניתן אישור לקריאת הקובץ.";
+    if (res.status === "invalid") return "הקובץ המחובר אינו קובץ גיבוי תקין של SpeakUp.";
+    if (res.status === "error") return "לא הצלחנו לקרוא את הקובץ (ייתכן שהוא עדיין מסתנכרן).";
+    if (res.status !== "ok") return "";
+    if (res.deviceId && res.deviceId === getDeviceId()) {
+      setPeer(null);
+      return "הקובץ שחובר הוא הגיבוי של המכשיר הזה - יש לחבר את הקובץ של המכשיר השני.";
+    }
+    const last = readPeerMeta().lastMergedAt;
+    if (last && res.exportedAt && res.exportedAt <= last) { setPeer(null); return "אין גיבוי חדש מהמכשיר השני."; }
+    const { state: merged, report } = mergeBackupState(st, res.incoming);
+    if (!describeMergeReport(report).length) {
+      if (res.exportedAt) writePeerMeta({ lastMergedAt: res.exportedAt });
+      setPeer(null);
+      return "אין מה למזג - הנתונים כאן כבר מעודכנים.";
+    }
+    setPeer({ kind: "new", name: res.name, exportedAt: res.exportedAt, merged, report });
+    setPeerDismissed(false);
+    return "נמצא גיבוי חדש - ראו את הבאנר בדף הבית.";
+  }, []);
+
+  const peerCheckedRef = useRef(false);
+  useEffect(() => {
+    if (!state || peerCheckedRef.current) return;
+    peerCheckedRef.current = true;
+    evaluatePeer(state, false);
+  }, [state, evaluatePeer]);
+
+  async function onPeerAction() {
+    if (!peer) return;
+    if (peer.kind === "ask") {
+      await evaluatePeer(state, true);
+      return;
+    }
+    const lines = describeMergeReport(peer.report);
+    if (!window.confirm(`גיבוי מהמכשיר השני (${fmtWhen(peer.exportedAt)}) יצרף לכאן:\n\n${lines.join("\n")}\n\nאפשר לבטל מההגדרות. למזג?`)) return;
+    try { localStorage.setItem(PREMERGE_KEY, JSON.stringify({ at: Date.now(), state })); } catch (e) { /* noop */ }
+    persist(peer.merged);
+    if (peer.exportedAt) writePeerMeta({ lastMergedAt: peer.exportedAt });
+    writeBackupFile(peer.merged).then((r) => { if (r === "ok") setBackupTick((t) => t + 1); });
+    setPeer(null);
+  }
 
   // after every completed practice session, refresh the auto-backup file (if one was connected)
   const prevSessionsRef = useRef(null);
@@ -3286,6 +3474,9 @@ export default function App() {
               chunkTotal={Object.keys(langData.chunks || {}).length}
               backupStale={state.stats.sessionsCompleted >= 3 && (() => { const d = daysSinceBackup(); return d === null || d >= 7; })()}
               onGo={goTab}
+              peerBanner={peer && !peerDismissed ? peer : null}
+              onPeerAction={onPeerAction}
+              onPeerDismiss={() => setPeerDismissed(true)}
             />
           )}
 
@@ -3349,6 +3540,7 @@ export default function App() {
                 writeBackupFile(merged).then((r) => { if (r === "ok") setBackupTick((t) => t + 1); });
               }}
               onBackedUp={() => setBackupTick((t) => t + 1)}
+              onPeerCheck={() => evaluatePeer(state, true)}
             />
           )}
 
