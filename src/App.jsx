@@ -346,6 +346,292 @@ function sanitizeChunkText(s) {
   return String(s || "").replace(/\.{2,}|…/g, " ").replace(/\s+/g, " ").trim();
 }
 
+// Built-in pack of English linking words / connectors (from the user's list), with example sentences.
+// Each item: [text, hebrew, example, exampleHebrew, hint?]
+const CONNECTOR_PACK = [
+  {
+    id: "basic",
+    label: "בסיס - מילים שחייבים",
+    items: [
+      ["and", "ו", "I bought bread and milk.", "קניתי לחם וחלב."],
+      ["but", "אבל", "I wanted to go, but I was tired.", "רציתי ללכת, אבל הייתי עייף."],
+      ["or", "או", "Do you want tea or coffee?", "אתה רוצה תה או קפה?"],
+      ["if", "אם", "If it rains, we'll stay home.", "אם ירד גשם, נישאר בבית."],
+      ["when", "כש", "When I got home, he was asleep.", "כשהגעתי הביתה הוא ישן."],
+      ["then", "אז, ואז", "Finish your work, then you can relax.", "סיים את העבודה, ואז תוכל להירגע."],
+      ["also", "גם", "She also speaks Italian.", "היא גם מדברת איטלקית."],
+      ["although", "למרות ש", "Although it was late, we kept talking.", "למרות שהיה מאוחר, המשכנו לדבר."],
+      ["though", "אף ש, אבל", "It's a nice place, though a bit noisy.", "זה מקום נחמד, אם כי קצת רועש."],
+      ["instead", "במקום זה", "I don't want coffee. I'll have tea instead.", "אני לא רוצה קפה. אקח תה במקום זה."],
+      ["instead of", "במקום", "Let's walk instead of taking the bus.", "בואו נלך ברגל במקום לנסוע באוטובוס."],
+      ["otherwise", "אחרת", "Hurry up, otherwise we'll miss the train.", "תמהר, אחרת נפספס את הרכבת."],
+      ["unless", "אלא אם כן", "I won't go unless you come too.", "אני לא אלך אלא אם כן תבוא גם אתה."],
+      ["or else", "אחרת", "Be quiet, or else you'll wake the baby.", "שקט, אחרת תעיר את התינוק."],
+      ["maybe", "אולי", "Maybe we should try again tomorrow.", "אולי כדאי שננסה שוב מחר."],
+    ],
+  },
+  {
+    id: "compare",
+    label: "השוואה וניגוד בין דברים",
+    items: [
+      ["whereas", "ואילו", "He loves cities, whereas I prefer the countryside.", "הוא אוהב ערים, ואילו אני מעדיף את הכפר."],
+      ["unlike", "בניגוד ל", "Unlike my brother, I hate waking up early.", "בניגוד לאחי, אני שונא לקום מוקדם."],
+      ["in contrast", "לעומת זאת", "In contrast, the new model is much quieter.", "לעומת זאת, הדגם החדש שקט הרבה יותר."],
+      ["on the contrary", "להפך", "I'm not angry. On the contrary, I'm happy.", "אני לא כועס. להפך, אני שמח."],
+      ["compared to", "בהשוואה ל", "Compared to last year, prices went up.", "בהשוואה לשנה שעברה, המחירים עלו."],
+      ["rather than", "ולא", "I'd rather walk than take the bus.", "אני מעדיף ללכת ולא לנסוע באוטובוס."],
+      ["as well", "גם כן", "I'll have a coffee as well.", "אקח גם כן קפה."],
+      ["the same as", "אותו דבר כמו", "My phone is the same as yours.", "הטלפון שלי זהה לשלך."],
+      ["different from", "שונה מ", "This one is different from the others.", "זה שונה מהאחרים."],
+    ],
+  },
+  {
+    id: "condition",
+    label: "תנאי",
+    items: [
+      ["provided that", "בתנאי ש", "You can borrow it, provided that you return it.", "אפשר לשאול את זה, בתנאי שתחזיר."],
+      ["as long as", "כל עוד, כל זמן ש", "It's fine as long as you're careful.", "זה בסדר כל עוד אתה זהיר."],
+      ["in case", "למקרה ש", "Take an umbrella in case it rains.", "קח מטרייה למקרה שירד גשם."],
+      ["in that case", "במקרה כזה", "In that case, let's meet tomorrow.", "במקרה כזה, בואו ניפגש מחר."],
+      ["if not", "אם לא", "I'll come tomorrow, and if not, I'll call you.", "אבוא מחר, ואם לא, אתקשר אליך."],
+      ["even then", "גם אז", "Even then, he refused to help.", "גם אז הוא סירב לעזור."],
+      ["depending on", "בהתאם ל, תלוי ב", "The price changes depending on the season.", "המחיר משתנה בהתאם לעונה."],
+    ],
+  },
+  {
+    id: "sequence",
+    label: "סדר והצגת רעיונות",
+    items: [
+      ["to begin with", "להתחלה", "To begin with, let's check the numbers.", "להתחלה, בואו נבדוק את המספרים."],
+      ["firstly", "ראשית", "Firstly, we need a plan.", "ראשית, אנחנו צריכים תוכנית."],
+      ["secondly", "שנית", "Secondly, we need a budget.", "שנית, אנחנו צריכים תקציב."],
+      ["after that", "אחרי זה", "After that, we went home.", "אחרי זה הלכנו הביתה."],
+      ["next", "בשלב הבא", "Next, add the eggs.", "בשלב הבא, הוסיפו את הביצים."],
+      ["lastly", "לסיום", "Lastly, don't forget to sign.", "לסיום, אל תשכחו לחתום."],
+      ["on top of that", "ועוד מעבר לזה", "It was late, and on top of that, it was raining.", "היה מאוחר, ועוד מעבר לזה ירד גשם."],
+      ["that is", "כלומר", "We leave at six, that is, in an hour.", "אנחנו יוצאים בשש, כלומר בעוד שעה."],
+      ["namely", "דהיינו", "Only one thing matters, namely time.", "רק דבר אחד חשוב, דהיינו זמן."],
+      ["to put it simply", "במילים פשוטות", "To put it simply, we ran out of money.", "במילים פשוטות, נגמר לנו הכסף."],
+    ],
+  },
+  {
+    id: "spoken",
+    label: "שיחה יומיומית",
+    items: [
+      ["by the way", "דרך אגב", "By the way, did you call him?", "דרך אגב, התקשרת אליו?"],
+      ["anyway", "בכל מקרה", "Anyway, let's get back to work.", "בכל מקרה, בואו נחזור לעבודה."],
+      ["actually", "בעצם", "Actually, I changed my mind.", "בעצם, שיניתי את דעתי."],
+      ["to be honest", "לומר את האמת", "To be honest, I didn't like the movie.", "לומר את האמת, לא אהבתי את הסרט."],
+      ["I mean", "כלומר, אני מתכוון", "It's fine. I mean, it could be better.", "זה בסדר. כלומר, זה יכול להיות יותר טוב."],
+      ["you know", "אתה יודע", "It's, you know, a bit complicated.", "זה, אתה יודע, קצת מסובך."],
+      ["of course", "כמובן", "Of course, I'll help you.", "כמובן, אעזור לך."],
+      ["as far as I know", "למיטב ידיעתי", "As far as I know, he's still abroad.", "למיטב ידיעתי, הוא עדיין בחו\"ל."],
+      ["speaking of", "אם כבר מדברים על", "Speaking of food, I'm hungry.", "אם כבר מדברים על אוכל, אני רעב."],
+      ["after all", "אחרי הכול", "Let him rest. After all, he's tired.", "תן לו לנוח. אחרי הכול, הוא עייף."],
+      ["in any case", "בכל מקרה", "In any case, I'll call you tomorrow.", "בכל מקרה, אתקשר אליך מחר."],
+      ["as I said", "כמו שאמרתי", "As I said, I can't come tonight.", "כמו שאמרתי, אני לא יכול לבוא הערב."],
+      ["to tell the truth", "האמת היא ש", "To tell the truth, I forgot.", "האמת היא ששכחתי."],
+      ["at the same time", "יחד עם זאת", "He is strict. At the same time, he is fair.", "הוא קפדן. יחד עם זאת, הוא הוגן."],
+    ],
+  },
+  {
+    id: "agree",
+    label: "הסכמה והתנגדות",
+    items: [
+      ["I agree", "אני מסכים", "I agree with you completely.", "אני מסכים איתך לגמרי."],
+      ["I disagree", "אני לא מסכים", "I disagree. I think it's a bad idea.", "אני לא מסכים. אני חושב שזה רעיון גרוע."],
+      ["exactly", "בדיוק", "Exactly, that's what I meant.", "בדיוק, זה מה שהתכוונתי."],
+      ["that's true", "זה נכון", "That's true, but it's expensive.", "זה נכון, אבל זה יקר."],
+      ["not necessarily", "לא בהכרח", "More expensive doesn't mean better, not necessarily.", "יקר יותר לא אומר טוב יותר, לא בהכרח."],
+      ["to some extent", "במידה מסוימת", "To some extent, you're right.", "במידה מסוימת, אתה צודק."],
+      ["that depends", "זה תלוי", "Is it worth it? That depends.", "האם זה שווה את זה? זה תלוי."],
+      ["I'm not sure", "אני לא בטוח", "I'm not sure that's a good idea.", "אני לא בטוח שזה רעיון טוב."],
+    ],
+  },
+  {
+    id: "example",
+    label: "דוגמה והשוואה",
+    items: [
+      ["for example", "לדוגמה", "I like many sports, for example tennis and swimming.", "אני אוהב הרבה ענפי ספורט, לדוגמה טניס ושחייה."],
+      ["for instance", "למשל", "Some jobs are tiring, for instance driving a truck.", "יש עבודות מתישות, למשל נהיגה במשאית."],
+      ["such as", "כגון", "I enjoy fruits such as mango and melon.", "אני נהנה מפירות כגון מנגו ומלון."],
+      ["in other words", "במילים אחרות", "He is frugal, in other words he hates wasting money.", "הוא חסכן, במילים אחרות הוא שונא לבזבז כסף."],
+      ["in the same way", "באותה צורה", "In the same way, the second team lost its focus.", "באותה צורה, הקבוצה השנייה איבדה את הריכוז."],
+      ["just as", "בדיוק כמו", "Just as I expected, the meeting was long.", "בדיוק כמו שציפיתי, הפגישה הייתה ארוכה."],
+      ["much as", "כמו, במידה דומה", "Much as I love pizza, I can't eat it every day.", "כמה שאני אוהב פיצה, אני לא יכול לאכול אותה כל יום."],
+      ["similarly", "באופן דומה", "Similarly, our competitors raised their prices.", "באופן דומה, המתחרים שלנו העלו מחירים."],
+      ["especially", "במיוחד", "I love summer, especially the evenings.", "אני אוהב את הקיץ, במיוחד את הערבים."],
+    ],
+  },
+  {
+    id: "addition",
+    label: "הוספה",
+    items: [
+      ["in addition", "בנוסף", "In addition, we need a bigger budget.", "בנוסף, אנחנו צריכים תקציב גדול יותר."],
+      ["additionally", "בנוסף", "Additionally, the hotel offers free breakfast.", "בנוסף, המלון מציע ארוחת בוקר חינם."],
+      ["along with", "יחד עם", "She sent the report along with a short note.", "היא שלחה את הדוח יחד עם פתק קצר."],
+      ["as well as", "כמו גם", "He speaks French as well as Spanish.", "הוא מדבר צרפתית כמו גם ספרדית."],
+      ["besides", "חוץ מזה", "Besides, it's too late to change the plan.", "חוץ מזה, מאוחר מדי לשנות את התוכנית."],
+      ["furthermore", "יתרה מכך", "Furthermore, the results were never published.", "יתרה מכך, התוצאות מעולם לא פורסמו."],
+      ["moreover", "יתר על כן", "Moreover, the system is easy to use.", "יתר על כן, המערכת קלה לשימוש."],
+      ["including", "כולל", "The price is 100 dollars, including tax.", "המחיר הוא 100 דולר, כולל מס."],
+      ["not only but also", "לא רק אלא גם", "She is not only smart but also very kind.", "היא לא רק חכמה אלא גם מאוד אדיבה.", "בין שתי המילים באים שני רעיונות"],
+      ["not to mention", "שלא לדבר על", "It's expensive, not to mention far away.", "זה יקר, שלא לדבר על כך שזה רחוק."],
+    ],
+  },
+  {
+    id: "contrast",
+    label: "ניגוד וויתור",
+    items: [
+      ["however", "עם זאת", "I like the idea. However, it costs too much.", "אני אוהב את הרעיון. עם זאת, הוא עולה יותר מדי."],
+      ["on the other hand", "מצד שני", "On the other hand, we could wait a week.", "מצד שני, אפשר לחכות שבוע."],
+      ["on one hand on the other hand", "מצד אחד ומצד שני", "On one hand it's cheap, on the other hand it's slow.", "מצד אחד זה זול, מצד שני זה איטי.", "בין שני החלקים באים שני צדדים"],
+      ["nevertheless", "למרות זאת", "It rained. Nevertheless, we went hiking.", "ירד גשם. למרות זאת יצאנו לטייל."],
+      ["nonetheless", "בכל זאת", "The test was hard; nonetheless, I passed.", "המבחן היה קשה; בכל זאת עברתי."],
+      ["despite", "למרות", "Despite the noise, I fell asleep.", "למרות הרעש נרדמתי."],
+      ["in spite of", "למרות", "In spite of the rain, the game went on.", "למרות הגשם, המשחק נמשך."],
+      ["even though", "אף על פי ש", "Even though I was tired, I kept working.", "אף על פי שהייתי עייף, המשכתי לעבוד."],
+      ["even if", "גם אם", "Even if it's late, call me.", "גם אם מאוחר, תתקשר אליי."],
+      ["still", "בכל זאת", "It was cold, but we still went swimming.", "היה קר, אבל בכל זאת שחינו."],
+      ["then again", "אבל מצד שני", "It's pricey. Then again, it's good quality.", "זה יקר. אבל מצד שני, זו איכות טובה."],
+      ["except", "חוץ מ", "Everyone came except Dan.", "כולם הגיעו חוץ מדן."],
+      ["without", "בלי", "I can't start my day without coffee.", "אני לא יכול להתחיל את היום בלי קפה."],
+    ],
+  },
+  {
+    id: "emphasis",
+    label: "הדגשה",
+    items: [
+      ["above all", "מעל לכול", "Above all, stay calm.", "מעל לכול, שמרו על קור רוח."],
+      ["certainly", "בהחלט", "Certainly, I can help you with that.", "בהחלט, אני יכול לעזור לך בזה."],
+      ["in particular", "במיוחד", "I enjoyed the food, in particular the soup.", "נהניתי מהאוכל, במיוחד מהמרק."],
+      ["specifically", "באופן ספציפי", "I need help with one thing, specifically the report.", "אני צריך עזרה בדבר אחד, באופן ספציפי הדוח."],
+      ["in fact", "למעשה", "He isn't rude. In fact, he's very polite.", "הוא לא גס רוח. למעשה, הוא מאוד מנומס."],
+      ["in general", "באופן כללי", "In general, I prefer working in the morning.", "באופן כללי, אני מעדיף לעבוד בבוקר."],
+      ["mainly", "בעיקר", "I use my phone mainly for work.", "אני משתמש בטלפון בעיקר לעבודה."],
+      ["surprisingly", "באופן מפתיע", "Surprisingly, the exam was easy.", "באופן מפתיע, המבחן היה קל."],
+      ["not only but", "לא רק אלא", "He is not only late but also unprepared.", "הוא לא רק מאחר אלא גם לא מוכן.", "בין שתי המילים באים שני רעיונות"],
+      ["either or", "או או", "You can either call me or send a message.", "אפשר או להתקשר אליי או לשלוח הודעה.", "בין שתי המילים באות שתי אפשרויות"],
+      ["neither nor", "לא ולא", "She neither smiled nor said a word.", "היא לא חייכה ולא אמרה מילה.", "בין שתי המילים באים שני דברים"],
+      ["both and", "גם וגם", "I like both tea and coffee.", "אני אוהב גם תה וגם קפה.", "בין שתי המילים באים שני דברים"],
+      ["whether or", "בין אם ובין אם", "Whether it rains or not, we're going.", "בין אם ירד גשם ובין אם לא, אנחנו נוסעים.", "בין שתי המילים באות שתי אפשרויות"],
+      ["too much", "יותר מדי", "I ate too much last night.", "אכלתי יותר מדי אתמול בלילה."],
+    ],
+  },
+  {
+    id: "time",
+    label: "זמן וסדר",
+    items: [
+      ["at first", "בהתחלה", "At first, I didn't understand him.", "בהתחלה לא הבנתי אותו."],
+      ["first of all", "קודם כול", "First of all, thank you for coming.", "קודם כול, תודה שבאתם."],
+      ["initially", "בתחילה", "Initially, the plan seemed simple.", "בתחילה התוכנית נראתה פשוטה."],
+      ["primarily", "בראש ובראשונה", "This app is designed primarily for beginners.", "האפליקציה הזו מיועדת בראש ובראשונה למתחילים."],
+      ["after", "אחרי", "After lunch, we took a walk.", "אחרי ארוחת הצהריים יצאנו להליכה."],
+      ["afterwards", "לאחר מכן", "Afterwards, we went for coffee.", "לאחר מכן הלכנו לקפה."],
+      ["before", "לפני", "Call me before you leave.", "תתקשר אליי לפני שאתה יוצא."],
+      ["prior to", "קודם ל", "Prior to the meeting, I reviewed the notes.", "קודם לפגישה עברתי על ההערות."],
+      ["previously", "קודם לכן", "Previously, I worked in a bank.", "קודם לכן עבדתי בבנק."],
+      ["later", "מאוחר יותר", "I'll call you later.", "אתקשר אליך מאוחר יותר."],
+      ["meanwhile", "בינתיים", "Meanwhile, the kids were playing outside.", "בינתיים הילדים שיחקו בחוץ."],
+      ["in the meantime", "בינתיים", "In the meantime, please take a seat.", "בינתיים, בבקשה שבו."],
+      ["simultaneously", "בו זמנית", "They pressed the button simultaneously.", "הם לחצו על הכפתור בו זמנית."],
+      ["while", "בזמן ש", "I listen to music while I cook.", "אני שומע מוזיקה בזמן שאני מבשל."],
+      ["during", "במהלך", "Please stay quiet during the movie.", "בבקשה שמרו על שקט במהלך הסרט."],
+      ["whenever", "בכל פעם ש", "Whenever I'm stressed, I go for a run.", "בכל פעם שאני לחוץ, אני יוצא לרוץ."],
+      ["as soon as", "מיד כש", "Call me as soon as you arrive.", "תתקשר אליי מיד כשתגיע."],
+      ["until", "עד ש", "Wait here until I come back.", "חכה כאן עד שאחזור."],
+      ["until now", "עד עכשיו", "Until now, I haven't had any problems.", "עד עכשיו לא היו לי בעיות."],
+      ["since", "מאז", "I've lived here since 2019.", "אני גר כאן מאז 2019."],
+      ["suddenly", "לפתע", "Suddenly, the lights went out.", "לפתע האורות כבו."],
+      ["immediately", "מיד", "Please reply immediately.", "בבקשה השב מיד."],
+      ["soon", "בקרוב", "The movie starts soon.", "הסרט מתחיל בקרוב."],
+      ["shortly", "בקרוב מאוד", "The doctor will see you shortly.", "הרופא יקבל אותך בקרוב מאוד."],
+      ["at last", "סוף סוף", "At last, we found a parking spot.", "סוף סוף מצאנו חניה."],
+      ["eventually", "בסופו של דבר", "Eventually, he agreed to help.", "בסופו של דבר הוא הסכים לעזור."],
+      ["finally", "לבסוף", "Finally, I'd like to thank everyone.", "לבסוף, אני רוצה להודות לכולם."],
+      ["not yet", "עדיין לא", "I haven't finished yet.", "עדיין לא סיימתי."],
+      ["the former", "הראשון מבין השניים", "I tried tea and coffee; the former was better.", "ניסיתי תה וקפה; הראשון היה טוב יותר."],
+      ["the latter", "האחרון מבין השניים", "I tried tea and coffee; the latter was too strong.", "ניסיתי תה וקפה; האחרון היה חזק מדי."],
+    ],
+  },
+  {
+    id: "place",
+    label: "מקום",
+    items: [
+      ["on top of", "מעל, על גבי", "The keys are on top of the fridge.", "המפתחות נמצאים מעל המקרר."],
+      ["behind", "מאחורי", "The garden is behind the house.", "הגינה נמצאת מאחורי הבית."],
+      ["opposite", "מול", "The bank is opposite the station.", "הבנק נמצא מול התחנה."],
+      ["adjacent to", "סמוך ל", "Our office is adjacent to the park.", "המשרד שלנו סמוך לפארק."],
+      ["beyond", "מעבר ל", "The hotel is just beyond the bridge.", "המלון נמצא ממש מעבר לגשר."],
+      ["around", "סביב", "We sat around the table.", "ישבנו סביב השולחן."],
+      ["close to", "קרוב ל", "I live close to the beach.", "אני גר קרוב לחוף."],
+    ],
+  },
+  {
+    id: "purpose",
+    label: "מטרה",
+    items: [
+      ["in order to", "כדי ל", "I left early in order to avoid traffic.", "יצאתי מוקדם כדי להימנע מפקקים."],
+      ["so as to", "כדי ל", "He spoke slowly so as to be understood.", "הוא דיבר לאט כדי שיבינו אותו."],
+      ["in an attempt to", "בניסיון ל", "She called him in an attempt to fix things.", "היא התקשרה אליו בניסיון לתקן את המצב."],
+      ["in an effort to", "במאמץ ל", "We cut costs in an effort to survive.", "קיצצנו בעלויות במאמץ לשרוד."],
+      ["with a view to", "מתוך מטרה ל", "He bought the house with a view to renting it.", "הוא קנה את הבית מתוך מטרה להשכיר אותו."],
+      ["for the purpose of", "לצורך", "The form is used for the purpose of registration.", "הטופס משמש לצורך רישום."],
+      ["with a focus on", "בהתמקדות ב", "The course is taught with a focus on speaking.", "הקורס מועבר בהתמקדות בדיבור."],
+    ],
+  },
+  {
+    id: "opinion",
+    label: "הבעת דעה",
+    items: [
+      ["I believe that", "אני מאמין ש", "I believe that practice makes perfect.", "אני מאמין שתרגול עושה מושלם."],
+      ["I feel that", "אני מרגיש ש", "I feel that we should wait.", "אני מרגיש שכדאי לחכות."],
+      ["I think", "אני חושב ש", "I think it's a great idea.", "אני חושב שזה רעיון מצוין."],
+      ["in my opinion", "לדעתי", "In my opinion, the first option is better.", "לדעתי, האפשרות הראשונה טובה יותר."],
+      ["in my view", "מנקודת מבטי", "In my view, we need more time.", "מנקודת מבטי, אנחנו צריכים עוד זמן."],
+    ],
+  },
+  {
+    id: "reason",
+    label: "סיבה",
+    items: [
+      ["because", "כי, מפני ש", "I stayed home because I was sick.", "נשארתי בבית כי הייתי חולה."],
+      ["because of", "בגלל", "We were late because of the traffic.", "איחרנו בגלל הפקקים."],
+      ["due to", "עקב", "The flight was cancelled due to the storm.", "הטיסה בוטלה עקב הסערה."],
+      ["due to the fact that", "לאור העובדה ש", "Due to the fact that it rained, the event moved indoors.", "לאור העובדה שירד גשם, האירוע עבר פנימה."],
+      ["owing to the fact that", "בשל העובדה ש", "Owing to the fact that he was ill, he missed the trip.", "בשל העובדה שהוא היה חולה, הוא החמיץ את הטיול."],
+      ["for this reason", "מסיבה זו", "For this reason, I decided to quit.", "מסיבה זו החלטתי להתפטר."],
+      ["now that", "עכשיו כש, מאחר ש", "Now that you're here, let's start.", "עכשיו כשאתם כאן, בואו נתחיל."],
+      ["as", "מכיוון ש", "As it was late, we went home.", "מכיוון שהיה מאוחר, הלכנו הביתה."],
+    ],
+  },
+  {
+    id: "result",
+    label: "תוצאה",
+    items: [
+      ["as a result", "כתוצאה מכך", "He didn't study. As a result, he failed.", "הוא לא למד. כתוצאה מכך הוא נכשל."],
+      ["consequently", "כתוצאה מכך", "Consequently, the project was delayed.", "כתוצאה מכך הפרויקט התעכב."],
+      ["accordingly", "בהתאם לכך", "The rules changed, so we acted accordingly.", "החוקים השתנו, ופעלנו בהתאם."],
+      ["and that's why", "וזו הסיבה ש", "I was tired, and that's why I went home.", "הייתי עייף, וזו הסיבה שהלכתי הביתה."],
+      ["therefore", "לכן", "It's raining. Therefore, we'll stay in.", "יורד גשם. לכן נישאר בפנים."],
+      ["hence", "לפיכך", "The road is closed, hence the delay.", "הכביש סגור, ומכאן העיכוב."],
+      ["thus", "כך, בכך", "He saved time, thus finishing early.", "הוא חסך זמן, ובכך סיים מוקדם."],
+      ["so", "אז, לכן", "It was late, so we left.", "היה מאוחר, אז עזבנו."],
+    ],
+  },
+  {
+    id: "summary",
+    label: "סיכום",
+    items: [
+      ["in short", "בקצרה", "In short, we need more time.", "בקצרה, אנחנו צריכים עוד זמן."],
+      ["briefly", "בקיצור", "Briefly, the plan has three steps.", "בקיצור, לתוכנית שלושה שלבים."],
+      ["in conclusion", "לסיכום", "In conclusion, the project was a success.", "לסיכום, הפרויקט הצליח."],
+      ["to sum up", "לסכם", "To sum up, we have two options.", "לסכם, יש לנו שתי אפשרויות."],
+      ["to conclude", "לסיים", "To conclude, I'd like to thank the team.", "לסיום, אני רוצה להודות לצוות."],
+    ],
+  },
+];
+
 /* ============================== HELPERS ============================== */
 
 const isDue = (dueStr) => dueStr <= todayStr();
@@ -3030,6 +3316,27 @@ function ChunkPractice({ lang, level, apiKey, chunks, blocked, onSave, onFinish,
     }
   }
 
+  // built-in connectors pack: items of a category that are not already learned/blocked
+  function packRemaining(cat) {
+    const have = new Set([...Object.values(bankRef.current).map((c) => normTokens(c.text).join(" ")), ...blockedRef.current.map((t) => normTokens(t).join(" "))]);
+    return cat.items.filter((it) => !have.has(normTokens(sanitizeChunkText(it[0])).join(" ")));
+  }
+
+  function startPack(cat) {
+    const picks = packRemaining(cat).slice(0, 7);
+    if (!picks.length) return;
+    const stamp = Date.now();
+    const next = { ...bankRef.current };
+    const fresh = picks.map((it, i) => ({
+      id: `cn-${stamp}-${i}`, text: sanitizeChunkText(it[0]), he: it[1], ex: it[2], exHe: it[3], slot: it[4] || "",
+      topic: `מילות קישור - ${cat.label}`, level: effectiveLevel,
+      box: 0, due: todayStr(), stage: 0, added: todayStr(), reviews: 0, lapses: 0,
+    }));
+    fresh.forEach((c) => { next[c.id] = c; });
+    commit(pruneBank(next));
+    beginSession(fresh.map((c) => bankRef.current[c.id]).filter(Boolean), true);
+  }
+
   function startReview() {
     beginSession(dueChunks(bankRef.current, todayStr()).slice(0, 10), true);
   }
@@ -3142,6 +3449,23 @@ function ChunkPractice({ lang, level, apiKey, chunks, blocked, onSave, onFinish,
         <button className="ela-btn" disabled={!customTopic.trim()} onClick={() => startNew(customTopic.trim())}>התחילו</button>
       </div>
       <div className="ela-chiprow">{TOPICS.map(topicBtn)}</div>
+
+      {lang === "en" && (
+        <div style={{ marginTop: 22 }}>
+          <p className="ela-sub" style={{ marginBottom: 4, fontWeight: 600 }}>מילות קישור - חבילה מוכנה:</p>
+          <p className="ela-note" style={{ marginTop: 0 }}>כל לחיצה מביאה עד 7 מילות קישור מהקטגוריה ומתחילה תרגול. המספר הוא כמה נשארו ללמוד.</p>
+          <div className="ela-chiprow">
+            {CONNECTOR_PACK.map((cat) => {
+              const left = packRemaining(cat).length;
+              return (
+                <button key={cat.id} className="ela-chip" disabled={!left} style={!left ? { opacity: 0.5 } : undefined} onClick={() => startPack(cat)}>
+                  {cat.label} ({left})
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {all.length > 0 && (
         <div style={{ marginTop: 22, display: "flex", gap: 8, flexWrap: "wrap" }}>
